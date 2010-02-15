@@ -123,8 +123,35 @@ nullModel = BasicDAEModel { equations = [], interventionRoots = [], forcedInequa
 type ModelBuilderT m a = StateT BasicDAEModel m a
 type ModelBuilder a = ModelBuilderT Identity a
 
-buildModelT x = evalStateT x nullModel
+buildModelT x = execStateT x nullModel
 buildModel = runIdentity . buildModelT
+
+x `newEqM` y = modify (\m -> m { equations = (RealEquation x y):(equations m) })
+x `newEqX` y = do
+  x' <- x
+  y' <- y
+  x' `newEqM` y'
+newEq = newEqX
+
+newInterventionRootM x = modify (\m -> m { interventionRoots = x:(interventionRoots m)})
+newInterventionRootX x =
+    do
+      x' <- x
+      newInterventionRootM x'
+newInterventionRoot = newInterventionRootX
+
+newForcedInequalityM x = modify (\m -> m { forcedInequalities = x:(forcedInequalities m)})
+newForcedInequalityX x =
+    do
+      x' <- x
+      newForcedInequalityM x'
+newForcedInequality = newForcedInequalityX
+
+msg `newCheckedConditionM` x = modify (\m -> m { checkedConditions = (msg, x):(checkedConditions m) })
+m `newCheckedConditionX` x = do
+  x' <- x
+  m `newCheckedConditionM` x'
+newCheckedCondition = newCheckedConditionX
 
 annotateModel :: (Show a, Show b, Show c, Monad m) => a -> b -> c -> ModelBuilderT m ()
 annotateModel s p o = modify (\m -> m { annotations = M.insert ((show s), (show p)) (show o) (annotations m) })
@@ -191,6 +218,7 @@ a `equalX` b = do
 
 realConstantM :: Monad m => Double -> ModelBuilderT m RealExpression
 realConstantM = return . RealConstant
+realConstant = realConstantM
 
 realCommonSubexpressionM :: Monad m => RealExpression -> ModelBuilderT m RealExpression
 realCommonSubexpressionM e =
@@ -202,25 +230,37 @@ realCommonSubexpressionM e =
 realCommonSubexpression me = me >>= realCommonSubexpressionM
 realCommonSubexpressionX = realCommonSubexpression
 
-newRealVariable :: Monad m => ModelBuilderT m RealVariable
-newRealVariable = do
+mkNewRealVariable :: Monad m => ModelBuilderT m RealVariable
+mkNewRealVariable = do
   id <- allocateID
   let v = RealVariable id
   modify (\m -> m { variables = v:(variables m) } )
   return v
 
-newRealVariableM :: Monad m => ModelBuilderT m (ModelBuilderT m RealVariable)
-newRealVariableM = liftM return newRealVariable
+mkNewRealVariableM :: Monad m => ModelBuilderT m (ModelBuilderT m RealVariable)
+mkNewRealVariableM = liftM return mkNewRealVariable
 
 realVariableM :: Monad m => RealVariable -> ModelBuilderT m RealExpression
 realVariableM = return . RealVariableE 
 realVariableX :: Monad m => ModelBuilderT m RealVariable -> ModelBuilderT m RealExpression
 realVariableX = liftM RealVariableE
+realVariable = realVariableX
+
+newRealVariableE = realVariable (mkNewRealVariable)
+newRealVariable :: Monad m => ModelBuilderT m (ModelBuilderT m RealExpression)
+newRealVariable = do
+  v <- newRealVariableE
+  return (return v)
 
 boundVariableM :: Monad m => ModelBuilderT m RealExpression
 boundVariableM = return $ BoundVariableE
 boundVariableX = boundVariableM
 boundVariable = boundVariableM
+
+derivativeM :: Monad m => RealExpression -> ModelBuilderT m RealExpression
+derivativeM = return . Derivative
+derivativeX = liftM Derivative
+derivative = derivativeX
 
 ifM :: Monad m => BoolExpression -> RealExpression ->
                       RealExpression -> ModelBuilderT m RealExpression

@@ -14,6 +14,7 @@ import Data.Maybe
 
 data CodeGenerationError = OtherProblem String
 instance Error CodeGenerationError where strMsg s = OtherProblem s
+instance Show CodeGenerationError where showsPrec _ (OtherProblem s) = showString "Error: " . showString s
 type AllowCodeGenError a = Either CodeGenerationError a
 
 makeCodeFor :: BasicDAEModel -> AllowCodeGenError String
@@ -21,7 +22,7 @@ makeCodeFor mod =
   do
     let mod' = removeUnusedVariablesAndCSEs (simplifyDerivatives mod)
     let (varCount, varNumMap) = numberVariables (variables mod')
-    return $ makeResFn mod' varCount varNumMap
+    return $ (makeResFn mod' varCount varNumMap) ++ (makeRootFn mod' varCount varNumMap)
 
 makeResFn mod varCount varNumMap =
   let
@@ -31,12 +32,15 @@ makeResFn mod varCount varNumMap =
       (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod varNumMap usedRealCSEs
       (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod varNumMap cseNo realCSEMap boolCSEMap' usedBoolCSEs
   in
-    "int modelResiduals(double time, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data)\n\
+    "int modelResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data)\n\
     \{\n" ++ 
     realcses ++ boolcses ++
     (makeResiduals mod varCount varNumMap realCSEMap boolCSEMap) ++
     (makeConditionChecks mod varNumMap realCSEMap boolCSEMap) ++
-    "\n}"
+    "}\n"
+
+makeRootFn mod varCount varNumMap =
+  
 
 escapeCString [] = []
 escapeCString (c:s)
@@ -61,9 +65,9 @@ makeConditionChecks (BasicDAEModel { checkedConditions = ccList}) varNumMap real
     in
       concatMap (oneConditionCheck varNumMap realCSEMap boolCSEMap) x
 
-inequalityResidual varMap realCSEMap boolCSEMap ieq = " + max(0.0, " ++ (realExpressionToString varMap realCSEMap boolCSEMap ieq) ++ ")"
-equationToResidual n varNumMap realCSEMap boolCSEMap (RealEquation e1 e2) suf =
-    (showString "res[" . shows n . showString "] = (" . showString (realExpressionToString varNumMap realCSEMap boolCSEMap e1)
+inequalityResidual varMap realCSEMap boolCSEMap ieq = realExpressionToString varMap realCSEMap boolCSEMap ieq
+equationToResidual n varNumMap realCSEMap boolCSEMap (RealEquation e1 e2) pref suf =
+    (showString "res[" . shows n . showString "] = " . showString pref . showString "(" . showString (realExpressionToString varNumMap realCSEMap boolCSEMap e1)
                 . showString ") - ("
                 . showString (realExpressionToString varNumMap realCSEMap boolCSEMap e2)
                 . showString ")" . showString suf) ";\n"
@@ -108,54 +112,147 @@ boolExpressionToString _ _ _ (BoolConstant True) = "1"
 boolExpressionToString _ _ _ (BoolConstant False) = "0"
 boolExpressionToString _ _ bcem (BoolCommonSubexpressionE bce) = (M.!) bcem bce
 boolExpressionToString vm rcem bcem (be1 `And` be2) =
-    (showString ('(':(boolExpressionToString vm rcem bcem be1)) . showString (")&&(") . showString (boolExpressionToString vm rcem bcem be2)
-                    . showString ")") ""
+    (showString ('(':(boolExpressionToString vm rcem bcem be1)) 
+     . showString (")&&(") 
+     . showString (boolExpressionToString vm rcem bcem be2)) ")"
 
 boolExpressionToString vm rcem bcem (be1 `Or` be2) =
-    (showString ('(':(boolExpressionToString vm rcem bcem be1)) . showString (")||(") . showString (boolExpressionToString vm rcem bcem be2)
-                    . showString ")") ""
+    (showString ('(':(boolExpressionToString vm rcem bcem be1))
+     . showString (")||(")
+     . showString (boolExpressionToString vm rcem bcem be2)) ")"
 
 boolExpressionToString vm rcem bcem (Not be1) =
-    (showString ('!':'(':(boolExpressionToString vm rcem bcem be1)) . showString (")")) ""
+    (showString ('!':'(':(boolExpressionToString vm rcem bcem be1))) ")"
 
 boolExpressionToString vm rcem bcem (re1 `LessThan` re2) =
-    (showString ('(':(realExpressionToString vm rcem bcem be1)) . showString (")||(") . showString (boolExpressionToString vm rcem bcem be2)
-                    . showString ")") ""
-
-
+    (showString ('(':(realExpressionToString vm rcem bcem re1))
+       . showString (")<(") 
+       . showString (realExpressionToString vm rcem bcem re2)) ")"
+boolExpressionToString vm rcem bcem (re1 `Equal` re2) =
+    (showString ('(':(realExpressionToString vm rcem bcem re1)) 
+     . showString (")==(") 
+     . showString (realExpressionToString vm rcem bcem re2)) ")"
 
 realExpressionToString :: M.Map RealVariable Int -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> RealExpression -> String
-realExpressionToString = undefined
+realExpressionToString _ _ _ (RealConstant c) = show c
+realExpressionToString vm _ _ (RealVariableE v) = (showString "v[" . shows ((M.!) vm v)) "]"
+realExpressionToString _ _ _ (BoundVariableE) = "t"
+realExpressionToString vm _ _ (Derivative (RealVariableE v)) = (showString "dv[" . shows ((M.!) vm v) . showString "]") ""
+realExpressionToString _ rcem _ (RealCommonSubexpressionE cse) = (M.!) rcem cse
+realExpressionToString vm rcem bcem (If b1 r1 r2) =
+  (showString "("
+   . showString (boolExpressionToString vm rcem bcem b1)
+   . showString ") ? ("
+   . showString (realExpressionToString vm rcem bcem r1)
+   . showString ") : (" 
+   . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (r1 `Plus` r2) =
+    (showString ('(':(realExpressionToString vm rcem bcem r1)) 
+     . showString (")+(") 
+     . showString (realExpressionToString vm rcem bcem r2)) ")"
+realExpressionToString vm rcem bcem (r1 `Minus` r2) =
+    (showString ('(':(realExpressionToString vm rcem bcem r1)) 
+     . showString (")-(") 
+     . showString (realExpressionToString vm rcem bcem r2)) ")"
+realExpressionToString vm rcem bcem (r1 `Times` r2) =
+    (showString ('(':(realExpressionToString vm rcem bcem r1)) 
+     . showString (")*(") 
+     . showString (realExpressionToString vm rcem bcem r2)) ")"
+realExpressionToString vm rcem bcem (r1 `Divided` r2) =
+    (showString ('(':(realExpressionToString vm rcem bcem r1)) 
+     . showString (")/(") 
+     . showString (realExpressionToString vm rcem bcem r2)) ")"
+realExpressionToString vm rcem bcem (r1 `Power` r2) =
+    (showString "pow(("
+      . showString (realExpressionToString vm rcem bcem r1)
+      . showString ("), (") 
+      . showString (realExpressionToString vm rcem bcem r2)) "))"
+realExpressionToString vm rcem bcem (Floor r1) = 
+    (showString "floor("
+     . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Ceiling r1) =
+    (showString "ceiling("
+     . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (LogBase r1 r2) =
+    (showString "log("
+      . showString (realExpressionToString vm rcem bcem r2)
+      . showString (") / log(") 
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Sin r1) =
+    (showString "sin("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Tan r1) =
+    (showString "tan("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Cos r1) =
+    (showString "cos("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ASin r1) =
+    (showString "asin("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ATan r1) =
+    (showString "atan("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ACos r1) =
+    (showString "acos("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Sinh r1) =
+    (showString "sinh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Tanh r1) =
+    (showString "tanh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (Cosh r1) =
+    (showString "cosh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ASinh r1) =
+    (showString "asinh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ATanh r1) =
+    (showString "atanh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+realExpressionToString vm rcem bcem (ACosh r1) =
+    (showString "acosh("
+      . showString (realExpressionToString vm rcem bcem r1)) ")"
+
 
 makeResiduals (BasicDAEModel { equations = [] }) _ _ _ _ = ""
 makeResiduals m@(BasicDAEModel { equations = e1:erest, forcedInequalities = ieqs }) varCount varNumMap realCSEMap boolCSEMap =
     -- The first equation is special, because the inequalities are appended to it.
-    (equationToResidual 0 varNumMap realCSEMap boolCSEMap e1
-                            (concatMap (inequalityResidual varNumMap realCSEMap boolCSEMap) ieqs)) ++
-    concatMap (\(i,e) -> equationToResidual i varNumMap realCSEMap boolCSEMap e "") (zip [1..] erest)
+    (if null ieqs
+     then
+        equationToResidual 0 varNumMap realCSEMap boolCSEMap e1 "" ""
+     else
+         let
+           iexpr = map (inequalityResidual varNumMap realCSEMap boolCSEMap) ieqs
+         in
+           (equationToResidual 0 varNumMap realCSEMap boolCSEMap e1 "max("
+              (", (-(" ++ (foldl' (\v s -> "min(" ++ s ++ "," ++ v ++ ")") (head iexpr) (tail iexpr)) ++ "))"))
+    ) ++ concatMap (\(i,e) -> equationToResidual i varNumMap realCSEMap boolCSEMap e "" "") (zip [1..] erest)
 
 simplifyDerivatives mod =
   snd $
     until ((==0) . fst) (\(_, mod') -> simplifyDerivativesRound mod' (buildVarMap mod')) (1, mod)
 simplifyDerivativesRound mod varmap =
-    (count, mod' { variables = varlist, nextID = nextIDv})
+    (count, mod' { variables = varlist, nextID = nextIDv, equations = equationlist ++ (equations mod')})
     where
-      (mod', (count, varmap', varlist, nextIDv)) =
-          runState (everywhereM (mkM simplifyOneDerivative) mod) (0, varmap, variables mod, nextID mod)
+      (mod', (count, varmap', varlist, equationlist, nextIDv)) =
+          runState (everywhereM (mkM simplifyOneDerivative) mod) (0, varmap, variables mod, [], nextID mod)
 
 simplifyOneDerivative d@(Derivative (RealVariableE _)) = return d
 simplifyOneDerivative (Derivative ex) =
   do
-    (count, varmap, varlist, id) <- get
-    let mv = M.lookup ex varmap
-    let (v, varmap', varlist', id') = case mv
+    ex' <- everywhereM (mkM simplifyOneDerivative) ex
+    (count, varmap, varlist, eqnlist, id) <- get
+    let mv = M.lookup ex' varmap
+    let (v, varmap', varlist', eqnlist', id') = case mv
          of
-           Just v -> (v, varmap, varlist, id)
+           Just v -> (v, varmap, varlist, eqnlist, id)
            Nothing ->
-            (v, M.insert ex v varmap, v:varlist, id - 1)
+            (v, M.insert ex' v varmap, v:varlist, (RealEquation (RealVariableE v) ex'):eqnlist, id - 1)
               where
                 v = RealVariable id
-    put (count + 1, varmap', varlist', id')
+    put (count + 1, varmap', varlist', eqnlist', id')
     return $ Derivative (RealVariableE v)
 simplifyOneDerivative d = return d
 
