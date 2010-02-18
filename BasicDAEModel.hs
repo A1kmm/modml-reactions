@@ -178,8 +178,12 @@ boolCommonSubexpressionM e =
     registerCommonSubexpression (FromBoolCommonSubexpression bcs)
     return $ BoolCommonSubexpressionE bcs
 
-boolCommonSubexpression me = me >>= boolCommonSubexpressionM
-boolCommonSubexpressionX = boolCommonSubexpression
+boolCommonSubexpressionX e =
+    e >>= boolCommonSubexpressionM
+
+boolCommonSubexpression me = do
+  ex <- boolCommonSubexpressionX me
+  return (return ex)
 
 andM :: Monad m => BoolExpression -> BoolExpression -> ModelBuilderT m BoolExpression
 a `andM` b = return $ a `And` b
@@ -227,8 +231,12 @@ realCommonSubexpressionM e =
     let rcs = RealCommonSubexpression id e
     registerCommonSubexpression (FromRealCommonSubexpression rcs)
     return $ RealCommonSubexpressionE rcs
-realCommonSubexpression me = me >>= realCommonSubexpressionM
-realCommonSubexpressionX = realCommonSubexpression
+realCommonSubexpressionX me = me >>= realCommonSubexpressionM
+
+realCommonSubexpression me = do
+  ex <- realCommonSubexpressionX me
+  return (return ex)
+
 
 mkNewRealVariable :: Monad m => ModelBuilderT m RealVariable
 mkNewRealVariable = do
@@ -425,3 +433,12 @@ xorX mx1 mx2 =
       x2 <- mx2
       xorM x1 x2
 
+initialValueM bv v iv = do
+  b1 <- boolCommonSubexpression (realConstant bv .==. boundVariable)
+  (ifX b1 (return v) (realConstant 0)) `newEq` (ifX b1 (realConstant iv) (realConstant 0))
+
+initialValueX bv v iv =
+  do
+    v' <- v
+    initialValueM bv v' iv
+initialValue = initialValueX
