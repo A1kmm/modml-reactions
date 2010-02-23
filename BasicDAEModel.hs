@@ -102,8 +102,12 @@ instance CommonSubexpression AnyCommonSubexpression
     commonSubexpressionId (FromBoolCommonSubexpression b) = commonSubexpressionId b
 
 data BasicDAEModel = BasicDAEModel {
-        -- The equations which apply for this model.
+        -- The equations which apply for this model at all times...
         equations :: [RealEquation],
+        -- The boundary conditions (equations which apply at the starting
+        -- point, and/or after interventions). Note that other equations also
+        -- apply at these times as well.
+        boundaryEquations :: [(BoolExpression, RealEquation)],
         -- Expressions which controls when the solver needs to be restarted.
         -- The values should cross zero at the point when the solver needs to
         -- be restarted.
@@ -116,8 +120,9 @@ data BasicDAEModel = BasicDAEModel {
         annotations :: M.Map (String, String) String,
         nextID :: Int
     } deriving (Eq, Ord, Typeable, Data)
-nullModel = BasicDAEModel { equations = [], interventionRoots = [], forcedInequalities = [], checkedConditions = [],
-                            variables = [], commonSubexpressions = [], annotations = M.empty, nextID = 0
+nullModel = BasicDAEModel { equations = [], boundaryEquations = [], interventionRoots = [],
+                            forcedInequalities = [], checkedConditions = [], variables = [],
+                            commonSubexpressions = [], annotations = M.empty, nextID = 0
                           }
 
 type ModelBuilderT m a = StateT BasicDAEModel m a
@@ -132,6 +137,14 @@ x `newEqX` y = do
   y' <- y
   x' `newEqM` y'
 newEq = newEqX
+
+newBoundaryEqM c x y = modify (\m -> m { boundaryEquations = (c, (RealEquation x y)):(boundaryEquations m) })
+newBoundaryEqX c x y = do
+  c' <- c
+  x' <- x
+  y' <- y
+  newBoundaryEqM c' x' y'
+newBoundaryEq = newBoundaryEqX
 
 newInterventionRootM x = modify (\m -> m { interventionRoots = x:(interventionRoots m)})
 newInterventionRootX x =
@@ -433,9 +446,8 @@ xorX mx1 mx2 =
       x2 <- mx2
       xorM x1 x2
 
-initialValueM bv v iv = do
-  b1 <- boolCommonSubexpression (realConstant bv .==. boundVariable)
-  (ifX b1 (return v) (realConstant 0)) `newEq` (ifX b1 (realConstant iv) (realConstant 0))
+initialValueM bv v iv =
+  newBoundaryEq (realConstant bv .==. boundVariable) (return v) (realConstant iv)
 
 initialValueX bv v iv =
   do

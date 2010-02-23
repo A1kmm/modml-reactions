@@ -23,8 +23,9 @@ makeCodeFor mod =
     let mod' = removeUnusedVariablesAndCSEs (simplifyDerivatives mod)
     let (varCount, varNumMap) = numberVariables (variables mod')
     return $ "#include \"SolverHead.h\"\n" ++
-             (makeResFn mod' varCount varNumMap) ++
-             (makeRootFn mod' varCount varNumMap) ++
+             (makeResFn mod' varNumMap) ++
+             (makeBoundaryResFn mod' varNumMap) ++
+             (makeRootFn mod' varNumMap) ++
              (makeVarId mod') ++
              (makeSettings mod' varCount)
 
@@ -49,9 +50,11 @@ boolToDoubleStr False = "0.0"
 
 makeSettings mod varCount =
   (showString "static int gNumVars = " . shows varCount . showString ";\n\
+   \static int gNumEquations = " . shows (length $ equations mod) . showString ";\n\
+   \static int gNumBoundaryEquations = " . shows (length $ boundaryEquations mod) . showString ";\n\
    \static int gNumInterventions = " . shows (length $ interventionRoots mod)) ";\n"
 
-makeResFn mod varCount varNumMap =
+makeResFn mod varNumMap =
   let
       considerCSEIn = (equations mod, forcedInequalities mod, checkedConditions mod)
       usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
@@ -65,12 +68,31 @@ makeResFn mod varCount varNumMap =
     \        * v = N_VGetArrayPointer(y),\n\
     \        * dv = N_VGetArrayPointer(derivy);\n" ++
     realcses ++ boolcses ++
-    (makeResiduals mod varCount varNumMap realCSEMap boolCSEMap) ++
+    (makeResiduals mod varNumMap realCSEMap boolCSEMap) ++
     (makeConditionChecks mod varNumMap realCSEMap boolCSEMap) ++
     "  return 0;\n\
     \}\n"
 
-makeRootFn mod varCount varNumMap =
+makeBoundaryResFn mod varNumMap =
+  let
+      n0 = (length (forcedInequalities mod)) + (length (equations mod))
+      considerCSEIn = boundaryEquations mod
+      usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
+      usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) considerCSEIn
+      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod varNumMap usedRealCSEs
+      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod varNumMap cseNo realCSEMap boolCSEMap' usedBoolCSEs
+  in
+    "static int boundaryResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data)\n\
+    \{\n\
+    \  double* res = N_VGetArrayPointer(resids),\n\
+    \        * v = N_VGetArrayPointer(y),\n\
+    \        * dv = N_VGetArrayPointer(derivy);\n" ++
+    realcses ++ boolcses ++
+    (makeBoundaryResiduals n0 mod varNumMap realCSEMap boolCSEMap) ++
+    "  return 0;\n\
+    \}\n"
+
+makeRootFn mod varNumMap =
   let
       usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) (interventionRoots mod)
       usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) (interventionRoots mod)
@@ -118,7 +140,7 @@ makeConditionChecks (BasicDAEModel { checkedConditions = ccList}) varNumMap real
       concatMap (oneConditionCheck varNumMap realCSEMap boolCSEMap) x
 
 inequalityResidual varMap realCSEMap boolCSEMap ieq = "-min(0, " ++ (realExpressionToString varMap realCSEMap boolCSEMap ieq) ++ ")"
-makeResidual n str =
+makeResidual (n, str) =
     (showString "res[" . shows n . showString "] = " . showString str) ";\n"
 
 equationToResidualString varNumMap realCSEMap boolCSEMap (RealEquation e1 e2) =
@@ -270,34 +292,25 @@ realExpressionToString vm rcem bcem (ACosh r1) =
     (showString "acosh("
       . showString (realExpressionToString vm rcem bcem r1)) ")"
 
-intermixLists' l [] [] = l
-intermixLists' l a [] = a ++ l
-intermixLists' l [] b = b ++ l
-intermixLists' l (a1:al) (b1:bl) = intermixLists' (a1:b1:l) al bl
-
-intermixLists = intermixLists' []
-
-makeResiduals :: BasicDAEModel -> Int -> M.Map RealVariable Int -> M.Map RealCommonSubexpression String ->
+makeResiduals :: BasicDAEModel -> M.Map RealVariable Int -> M.Map RealCommonSubexpression String ->
                  M.Map BoolCommonSubexpression String -> String
-makeResiduals m@(BasicDAEModel { equations = eqns, forcedInequalities = ieqs }) varCount varNumMap realCSEMap boolCSEMap =
+makeResiduals m@(BasicDAEModel { equations = eqns, forcedInequalities = ieqs }) varNumMap realCSEMap boolCSEMap =
     let
         ieqStrList = map (inequalityResidual varNumMap realCSEMap boolCSEMap) ieqs
         eqnStrList = map (equationToResidualString varNumMap realCSEMap boolCSEMap) eqns
-        strList = intermixLists ieqStrList eqnStrList
-        sll = ceiling ((fromIntegral (length strList))/(fromIntegral varCount))
+        strList = ieqStrList ++ eqnStrList
     in
-      fst $ foldl' (processResidualGroup sll) ("", strList) [0..(varCount - 1)]
+      concatMap makeResidual (zip [0..] strList)
 
-joinResiduals [] = ""
-joinResiduals (a:[]) = a
-joinResiduals (a:l) = "smax(" ++ a ++ ", " ++ (joinResiduals l) ++ ")"
-
-processResidualGroup sll (s, l) i =
+makeBoundaryResiduals :: Int -> BasicDAEModel -> M.Map RealVariable Int -> M.Map RealCommonSubexpression String ->
+                 M.Map BoolCommonSubexpression String -> String
+makeBoundaryResiduals n0 m@(BasicDAEModel { boundaryEquations = eqns }) varNumMap realCSEMap boolCSEMap =
     let
-        lfront = take sll l
-        lback = drop sll l
+        strList = map (\(c, eq) -> (boolExpressionToString varNumMap realCSEMap boolCSEMap c,
+                                    equationToResidualString varNumMap realCSEMap boolCSEMap eq)) eqns
     in
-      (s ++ makeResidual i (joinResiduals lfront), lback)
+      concatMap (\(i, (c, res)) -> "if (" ++ c ++ ")\n " ++ (makeResidual (i, res)) ++ "else\n " ++
+                                   (makeResidual (i, "0"))) (zip [n0..] strList)
 
 simplifyDerivatives mod =
   snd $
@@ -334,7 +347,7 @@ processEquationForVarMap st _ = st
 removeUnusedVariablesAndCSEs mod =
   let
     usedRealVars = everything S.union (S.empty `mkQ` findOneUsedRealVariable) (equations mod)
-    considerCSEIn = (equations mod, interventionRoots mod, forcedInequalities mod, checkedConditions mod)
+    considerCSEIn = (equations mod, boundaryEquations mod, interventionRoots mod, forcedInequalities mod, checkedConditions mod)
     usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
     usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) considerCSEIn
   in
