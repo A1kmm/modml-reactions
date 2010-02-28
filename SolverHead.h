@@ -2,18 +2,22 @@
 #include <stdio.h>
 #include <sundials/sundials_nvector.h>
 #include <nvector/nvector_serial.h>
-#include <kinsol/kinsol.h>
-#include <kinsol/kinsol_dense.h>
 #include <ida/ida.h>
 #include <ida/ida_spgmr.h>
 #include <ida/ida_dense.h>
+#include <lm.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int modelResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data);
-static int boundaryResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data);
+
+static int boundaryResiduals(double t, double* params, double* res);
 static int modelRoots(double t, N_Vector y, N_Vector derivy, realtype *gout, void *user_data);
-static int gNumVars, gNumInterventions, gNumEquations, gNumBoundaryEquations;
+static void translateParams(N_Vector y, N_Vector derivy, double* params);
+static void reverseTranslateParams(N_Vector y, N_Vector derivy, double* params);
+static int gNumVars, gNumInterventions, gNumEquations, gNumBoundaryEquations, gNumParams;
 static void setupIdVector(N_Vector id);
+static int checkConditions(double t, N_Vector y, N_Vector derivy);
 
 static double max(double x, double y) { if (x > y) return x; else return y; }
 static double min(double x, double y) { if (x < y) return x; else return y; }
@@ -90,29 +94,32 @@ show_results(double t, N_Vector y, N_Vector derivy)
 
 double gtStart;
 
-static int
-iv_sys_fn(N_Vector u, N_Vector f, void* dat)
+static void
+iv_sys_fn(double *p, double *hx, int m, int n, void* dat)
 {
-  double* yp = N_VGetArrayPointer(u),
-        * dyp = yp + gNumVars;
-  double *fp = N_VGetArrayPointer(f);
+  boundaryResiduals(gtStart, p, hx);
+}
 
-  N_Vector y = N_VMake_Serial(gNumVars, yp), dy = N_VMake_Serial(gNumVars, dyp);
+static void
+setup_parameters
+(
+ N_Vector y, N_Vector yp,
+ double* params,
+ int reverseTranslate
+)
+{
+  if (reverseTranslate)
+    reverseTranslateParams(y, yp, params);
 
-  int i;
-  
-  N_VConst(0, f);
+  if (gNumParams > gNumEquations + gNumBoundaryEquations)
+  {
+    handle_error(0, "Initial value solver", "model check", "More parameters at initial value than constrain available; unable to solve model.", NULL);
+  }
 
-  if (modelResiduals(gtStart, y, dy, f, NULL) != 0)
-    return -1;
-
-  if (boundaryResiduals(gtStart, y, dy, f, NULL) != 0)
-    return -1;
-
-  N_VDestroy(y);
-  N_VDestroy(dy);
-
-  return 0;
+  dlevmar_dif(iv_sys_fn, params, NULL, gNumParams,
+              gNumEquations + gNumBoundaryEquations,
+              1000000, NULL, NULL, NULL, NULL, NULL);
+  translateParams(y, yp, params);
 }
 
 static void
@@ -123,41 +130,16 @@ do_ida_solve(double tStart, double tMaxSolverStep, double tMaxReportStep, double
   N_Vector y = N_VNew_Serial(gNumVars);
   N_Vector yp = N_VNew_Serial(gNumVars);
 
+  double * params = malloc(gNumVars * 2 * sizeof(double));
+  memset(params, 0, gNumVars * 2);
+
   gtStart = tStart;
   N_VConst(0, y);
   N_VConst(0, yp);
 
   printf("[\n");
 
-  {
-    void * kin_mem = KINCreate();
-    int kinsize = imax(gNumVars * 2, gNumEquations + gNumBoundaryEquations);
-    N_Vector ksy = N_VNew_Serial(kinsize),
-             scale = N_VNew_Serial(kinsize);
-
-    N_VConst(1, ksy);
-    N_VConst(100.0, scale);
-
-    KINSetErrHandlerFn(kin_mem, handle_error, NULL);
-    KINInit(kin_mem, iv_sys_fn, ksy);
-    KINSetMaxNewtonStep(kin_mem, 1E100);
-    KINSpgmr(kin_mem, 0);
-    KINSol(kin_mem, ksy, KIN_LINESEARCH, scale, scale);
-
-    {
-      double * ksyptr = N_VGetArrayPointer(ksy), *yptr = N_VGetArrayPointer(y), 
-        *ypptr = N_VGetArrayPointer(yp);
-      int i;
-      for (i = 0; i < gNumVars; i++)
-        *yptr++ = *ksyptr++;
-      for (i = 0; i < gNumVars; i++)
-        *ypptr++ = *ksyptr++;
-    }
-
-    KINFree(&kin_mem);
-    N_VDestroy(ksy);
-    N_VDestroy(scale);
-  }
+  setup_parameters(y, yp, params, 0);
   
   IDAInit(ida_mem, modelResiduals, tStart, y, yp);
   IDASStolerances(ida_mem, reltol, abstol);
@@ -184,11 +166,17 @@ do_ida_solve(double tStart, double tMaxSolverStep, double tMaxReportStep, double
     tnext += tMaxReportStep;
     int ret = IDASolve(ida_mem, tnext, &tnext, y, yp, everyStep ? IDA_ONE_STEP : IDA_NORMAL);
     show_results(tnext, y, yp);
+    checkConditions(tnext, y, yp);
     if (ret == IDA_TSTOP_RETURN)
       break;
+    if (ret == IDA_ROOT_RETURN)
+    {
+      setup_parameters(y, yp, params, 1);
+    }
   }
 
   IDAFree(&ida_mem);
+  free(params);
 
   printf("Success\n]\n");
 }

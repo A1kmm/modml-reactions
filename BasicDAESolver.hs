@@ -11,23 +11,85 @@ import qualified Data.Set as S
 import Data.Generics
 import Control.Monad.State
 import Data.Maybe
+import Text.ParserCombinators.Parsec
 
 data CodeGenerationError = OtherProblem String
 instance Error CodeGenerationError where strMsg s = OtherProblem s
 instance Show CodeGenerationError where showsPrec _ (OtherProblem s) = showString "Error: " . showString s
 type AllowCodeGenError a = Either CodeGenerationError a
 
-makeCodeFor :: BasicDAEModel -> AllowCodeGenError String
+data IntegrationResult = FatalError (Int, String, String, String) |
+                         Warning (Int, String, String, String) |
+                         CheckedConditionFail String |
+                         Result (Double, [Double], [Double]) |
+                         Success deriving (Show, Read)
+
+modelToResults :: BasicDAEModel -> AllowCodeGenError ([IntegrationResult])
+modelToResults mod =
+
+makeCodeFor :: BasicDAEModel -> AllowCodeGenError (M.Map RealVariable Int, String)
 makeCodeFor mod =
   do
     let mod' = removeUnusedVariablesAndCSEs (simplifyDerivatives mod)
     let (varCount, varNumMap) = numberVariables (variables mod')
-    return $ "#include \"SolverHead.h\"\n" ++
-             (makeResFn mod' varNumMap) ++
-             (makeBoundaryResFn mod' varNumMap) ++
-             (makeRootFn mod' varNumMap) ++
-             (makeVarId mod') ++
-             (makeSettings mod' varCount)
+    let (paramNumMap, paramCount) = numberParameters mod'
+    return $ (varNumMap,
+              "#include \"SolverHead.h\"\n" ++
+              (makeResFn mod' varNumMap) ++
+              (makeBoundaryResFn mod' paramNumMap) ++
+              (makeTranslateParams varNumMap paramNumMap) ++
+              (makeRootFn mod' varNumMap) ++
+              (makeVarId mod') ++
+              (makeSettings mod' varCount paramCount) ++
+              (makeConditionChecks mod varNumMap)
+             )
+
+makeTranslateParams varNumMap paramNumMap =
+    "void translateParams(N_Vector y, N_Vector derivy, double* params)\n\
+    \{\n\
+    \ double * v = N_VGetArrayPointer(y),\n\
+    \        * dv = N_VGetArrayPointer(derivy);\n" ++
+    (concatMap (translateOneParam varNumMap) (M.toList paramNumMap)) ++ "\n\
+    \}\n" ++
+    "void reverseTranslateParams(N_Vector y, N_Vector derivy, double* params)\n\
+    \{\n\
+    \ double * v = N_VGetArrayPointer(y),\n\
+    \        * dv = N_VGetArrayPointer(derivy);\n" ++
+    (concatMap (reverseTranslateOneParam varNumMap) (M.toList paramNumMap)) ++ "\n\
+    \}\n"
+
+translateOneParam varNumMap ((RealVariableE v), paramNo) =
+  "v" ++ (translateOneParamVar varNumMap v paramNo)
+translateOneParam varNumMap ((Derivative (RealVariableE v)), paramNo) =
+  "dv" ++ (translateOneParamVar varNumMap v paramNo)
+
+translateOneParamVar varNumMap v paramNo =
+  (showString "[" . shows ((M.!) varNumMap v) . showString "] = params[" .
+   shows paramNo) "];\n"
+
+reverseTranslateOneParam varNumMap ((RealVariableE v), paramNo) =
+  (reverseTranslateOneParamVar "v" varNumMap v paramNo)
+reverseTranslateOneParam varNumMap ((Derivative (RealVariableE v)), paramNo) =
+  (reverseTranslateOneParamVar "dv" varNumMap v paramNo)
+
+reverseTranslateOneParamVar n varNumMap v paramNo =
+  (showString "params[" . shows paramNo . showString "] = " . showString n . showString "[" . shows ((M.!) varNumMap v)) "];\n"
+
+numberParameters :: BasicDAEModel -> (M.Map RealExpression Int, Int)
+numberParameters mod =
+  execState (everywhereM (mkM numberOneParameter) mod) (M.empty, 0)
+
+insertExpression e = do
+  (paramNumMap, nextNum) <- get
+  case (M.lookup e paramNumMap) of
+    Nothing -> do
+      put (M.insert e nextNum paramNumMap, nextNum + 1)
+      return e
+    Just _ -> return e
+
+numberOneParameter (e@(Derivative (RealVariableE _))) = insertExpression e
+numberOneParameter e@(RealVariableE _) = insertExpression e
+numberOneParameter e = return e
 
 makeVarId mod =
   let
@@ -48,19 +110,20 @@ findOneDeriv _ = S.empty
 boolToDoubleStr True = "1.0"
 boolToDoubleStr False = "0.0"
 
-makeSettings mod varCount =
+makeSettings mod varCount paramCount =
   (showString "static int gNumVars = " . shows varCount . showString ";\n\
    \static int gNumEquations = " . shows (length $ equations mod) . showString ";\n\
-   \static int gNumBoundaryEquations = " . shows (length $ boundaryEquations mod) . showString ";\n\
+   \static int gNumBoundaryEquations = " . shows ((length $ boundaryEquations mod) + (length $ forcedInequalities mod)) . showString ";\n\
+   \static int gNumParams = " . shows paramCount . showString ";\n\
    \static int gNumInterventions = " . shows (length $ interventionRoots mod)) ";\n"
 
 makeResFn mod varNumMap =
   let
-      considerCSEIn = (equations mod, forcedInequalities mod, checkedConditions mod)
+      considerCSEIn = (equations mod, forcedInequalities mod)
       usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
       usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) considerCSEIn
-      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod varNumMap usedRealCSEs
-      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod varNumMap cseNo realCSEMap boolCSEMap' usedBoolCSEs
+      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod (variableOrDerivDisplay varNumMap) usedRealCSEs
+      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod (variableOrDerivDisplay varNumMap) cseNo realCSEMap boolCSEMap' usedBoolCSEs
   in
     "static int modelResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data)\n\
     \{\n\
@@ -69,35 +132,31 @@ makeResFn mod varNumMap =
     \        * dv = N_VGetArrayPointer(derivy);\n" ++
     realcses ++ boolcses ++
     (makeResiduals mod varNumMap realCSEMap boolCSEMap) ++
-    (makeConditionChecks mod varNumMap realCSEMap boolCSEMap) ++
     "  return 0;\n\
     \}\n"
 
-makeBoundaryResFn mod varNumMap =
+makeBoundaryResFn mod paramNumMap =
   let
-      n0 = (length (forcedInequalities mod)) + (length (equations mod))
-      considerCSEIn = boundaryEquations mod
+      considerCSEIn = (equations mod, forcedInequalities mod, boundaryEquations mod)
       usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
       usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) considerCSEIn
-      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod varNumMap usedRealCSEs
-      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod varNumMap cseNo realCSEMap boolCSEMap' usedBoolCSEs
+      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod (paramDisplay paramNumMap) usedRealCSEs
+      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod (paramDisplay paramNumMap) cseNo realCSEMap boolCSEMap' usedBoolCSEs
   in
-    "static int boundaryResiduals(double t, N_Vector y, N_Vector derivy, N_Vector resids, void* user_data)\n\
-    \{\n\
-    \  double* res = N_VGetArrayPointer(resids),\n\
-    \        * v = N_VGetArrayPointer(y),\n\
-    \        * dv = N_VGetArrayPointer(derivy);\n" ++
+    "static int boundaryResiduals(double t, double *params, double *res)\n\
+    \{\n" ++
     realcses ++ boolcses ++
-    (makeBoundaryResiduals n0 mod varNumMap realCSEMap boolCSEMap) ++
+    (makeBoundaryResiduals mod paramNumMap realCSEMap boolCSEMap) ++
     "  return 0;\n\
     \}\n"
 
+makeRootFn :: BasicDAEModel -> M.Map RealVariable Int -> String
 makeRootFn mod varNumMap =
   let
       usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) (interventionRoots mod)
       usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) (interventionRoots mod)
-      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod varNumMap usedRealCSEs
-      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod varNumMap cseNo realCSEMap boolCSEMap' usedBoolCSEs
+      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod (variableOrDerivDisplay varNumMap) usedRealCSEs
+      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod (variableOrDerivDisplay varNumMap) cseNo realCSEMap boolCSEMap' usedBoolCSEs
   in
     "static int modelRoots(double t, N_Vector y, N_Vector derivy, realtype *gout, void *user_data)\n\
     \{\n\
@@ -114,7 +173,7 @@ makeInterventionRoots mod varMap realCSEMap boolCSEMap =
 
 makeOneInterventionRoot varMap realCSEMap boolCSEMap (i, root) =
     (showString "gout[" . shows i . showString "] = " .
-       showString (realExpressionToString varMap realCSEMap boolCSEMap root)) ";\n"
+       showString (realExpressionToString (variableOrDerivDisplay varMap) realCSEMap boolCSEMap root)) ";\n"
 
 escapeCString [] = []
 escapeCString (c:s)
@@ -126,65 +185,75 @@ escapeCString (c:s)
 
 oneConditionCheck :: M.Map RealVariable Int -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> (String, BoolExpression) -> String
 oneConditionCheck varNumMap realCSEMap boolCSEMap (msg, cond) =
-    "if (" ++ (boolExpressionToString varNumMap realCSEMap boolCSEMap cond) ++ ")\n\
+    "if (" ++ (boolExpressionToString (variableOrDerivDisplay varNumMap) realCSEMap boolCSEMap cond) ++ ")\n\
     \{\n\
     \  checkedConditionFail(\"" ++ (escapeCString msg) ++ "\");\n\
     \  return -1;\n\
     \}\n"
 
-makeConditionChecks (BasicDAEModel { checkedConditions = ccList}) varNumMap realCSEMap boolCSEMap =
+makeConditionChecks mod@(BasicDAEModel { checkedConditions = ccList}) varNumMap =
     let
-        x :: [(String, BoolExpression)]
-        x = ccList
+      considerCSEIn = checkedConditions
+      usedRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) considerCSEIn
+      usedBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) considerCSEIn
+      (cseNo, realCSEMap, boolCSEMap', realcses) = buildRealCSEs mod (variableOrDerivDisplay varNumMap) usedRealCSEs
+      (_, boolCSEMap, _, boolcses) = buildBoolCSEs mod (variableOrDerivDisplay varNumMap) cseNo realCSEMap boolCSEMap' usedBoolCSEs
     in
-      concatMap (oneConditionCheck varNumMap realCSEMap boolCSEMap) x
+      "static int checkConditions(double t, N_Vector y, N_Vector derivy)\n\
+      \{\n\
+      \  double* v = N_VGetArrayPointer(y),\n\
+      \        * dv = N_VGetArrayPointer(derivy);\n" ++
+      realcses ++ boolcses ++
+      (concatMap (oneConditionCheck varNumMap realCSEMap boolCSEMap) ccList) ++
+      "  return 0;\n}\n"
 
-inequalityResidual varMap realCSEMap boolCSEMap ieq = "-min(0, " ++ (realExpressionToString varMap realCSEMap boolCSEMap ieq) ++ ")"
+inequalityResidual vnf realCSEMap boolCSEMap ieq = "-min(0, " ++ (realExpressionToString vnf realCSEMap boolCSEMap ieq) ++ ")"
+inequalityTest vnf realCSEMap boolCSEMap ieq = "((" ++ (realExpressionToString vnf realCSEMap boolCSEMap ieq) ++ ") > 0)"
 makeResidual (n, str) =
     (showString "res[" . shows n . showString "] = " . showString str) ";\n"
 
-equationToResidualString varNumMap realCSEMap boolCSEMap (RealEquation e1 e2) =
-    (showString "((" . showString (realExpressionToString varNumMap realCSEMap boolCSEMap e1)
+equationToResidualString vnf realCSEMap boolCSEMap (RealEquation e1 e2) =
+    (showString "((" . showString (realExpressionToString vnf realCSEMap boolCSEMap e1)
                 . showString ") - ("
-                . showString (realExpressionToString varNumMap realCSEMap boolCSEMap e2)
+                . showString (realExpressionToString vnf realCSEMap boolCSEMap e2)
     ) "))"
 
-buildRealCSE m varNumMap cse@(RealCommonSubexpression id ex) (nalloc, realCSEMap, boolCSEMap, s) 
+buildRealCSE m vnf cse@(RealCommonSubexpression id ex) (nalloc, realCSEMap, boolCSEMap, s) 
     | isJust $ M.lookup cse realCSEMap = (nalloc, realCSEMap, boolCSEMap, s)
     | otherwise =
         let
             neededRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) ex
             (nalloc', realCSEMap', boolCSEMap', s') =
-                 S.fold (buildRealCSE m varNumMap) (nalloc, realCSEMap, boolCSEMap, s) neededRealCSEs
+                 S.fold (buildRealCSE m vnf) (nalloc, realCSEMap, boolCSEMap, s) neededRealCSEs
             neededBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) ex
             (nalloc'', boolCSEMap'', realCSEMap'', s'') =
-                 S.fold (buildBoolCSE m varNumMap) (nalloc', boolCSEMap', realCSEMap', s') neededBoolCSEs
+                 S.fold (buildBoolCSE m vnf) (nalloc', boolCSEMap', realCSEMap', s') neededBoolCSEs
             v = "c" ++ show nalloc''
         in
           (nalloc'' + 1, M.insert cse v realCSEMap', boolCSEMap'',
-           s'' ++ "double " ++ v ++ " = " ++ (realExpressionToString varNumMap realCSEMap'' boolCSEMap'' ex) ++ ";\n")
+           s'' ++ "double " ++ v ++ " = " ++ (realExpressionToString vnf realCSEMap'' boolCSEMap'' ex) ++ ";\n")
 
-buildBoolCSE :: BasicDAEModel -> M.Map RealVariable Int -> BoolCommonSubexpression -> (Int, M.Map BoolCommonSubexpression String, M.Map RealCommonSubexpression String, String) -> (Int, M.Map BoolCommonSubexpression String, M.Map RealCommonSubexpression String, String)
-buildBoolCSE m varNumMap cse@(BoolCommonSubexpression id ex) (nalloc, boolCSEMap, realCSEMap, s)
+buildBoolCSE :: BasicDAEModel -> (RealExpression -> String) -> BoolCommonSubexpression -> (Int, M.Map BoolCommonSubexpression String, M.Map RealCommonSubexpression String, String) -> (Int, M.Map BoolCommonSubexpression String, M.Map RealCommonSubexpression String, String)
+buildBoolCSE m vm cse@(BoolCommonSubexpression id ex) (nalloc, boolCSEMap, realCSEMap, s)
     | isJust $ M.lookup cse boolCSEMap = (nalloc, boolCSEMap, realCSEMap, s)
     | otherwise =
         let
             neededBoolCSEs = everything S.union (S.empty `mkQ` findOneUsedBoolCSE) ex
             (nalloc', boolCSEMap', realCSEMap', s') =
-                 S.fold (buildBoolCSE m varNumMap) (nalloc, boolCSEMap, realCSEMap, s) neededBoolCSEs
+                 S.fold (buildBoolCSE m vm) (nalloc, boolCSEMap, realCSEMap, s) neededBoolCSEs
             neededRealCSEs = everything S.union (S.empty `mkQ` findOneUsedRealCSE) ex
             (nalloc'', realCSEMap'', boolCSEMap'', s'') =
-                 S.fold (buildRealCSE m varNumMap) (nalloc', realCSEMap', boolCSEMap', s') neededRealCSEs
+                 S.fold (buildRealCSE m vm) (nalloc', realCSEMap', boolCSEMap', s') neededRealCSEs
             v = "c" ++ show nalloc''
         in
           (nalloc'' + 1, M.insert cse v boolCSEMap'', realCSEMap'',
-           s'' ++ "int " ++ v ++ " = " ++ (boolExpressionToString varNumMap realCSEMap'' boolCSEMap'' ex) ++ ";\n")
+           s'' ++ "int " ++ v ++ " = " ++ (boolExpressionToString vm realCSEMap'' boolCSEMap'' ex) ++ ";\n")
 
-buildRealCSEs model varNumMap = S.fold (buildRealCSE model varNumMap) (0, M.empty, M.empty, "")
-buildBoolCSEs model varNumMap cseNo realCSEMap boolCSEMap =
-    S.fold (buildBoolCSE model varNumMap) (cseNo, boolCSEMap, realCSEMap, "")
+buildRealCSEs model vm = S.fold (buildRealCSE model vm) (0, M.empty, M.empty, "")
+buildBoolCSEs model vm cseNo realCSEMap boolCSEMap =
+    S.fold (buildBoolCSE model vm) (cseNo, boolCSEMap, realCSEMap, "")
 
-boolExpressionToString :: M.Map RealVariable Int -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> BoolExpression -> String
+boolExpressionToString :: (RealExpression -> String) -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> BoolExpression -> String
 boolExpressionToString _ _ _ (BoolConstant True) = "1"
 boolExpressionToString _ _ _ (BoolConstant False) = "0"
 boolExpressionToString _ _ bcem (BoolCommonSubexpressionE bce) = (M.!) bcem bce
@@ -210,11 +279,19 @@ boolExpressionToString vm rcem bcem (re1 `Equal` re2) =
      . showString (")==(") 
      . showString (realExpressionToString vm rcem bcem re2)) ")"
 
-realExpressionToString :: M.Map RealVariable Int -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> RealExpression -> String
+variableOrDerivDisplay :: M.Map RealVariable Int -> RealExpression -> String
+variableOrDerivDisplay vm (RealVariableE v) = (showString "v[" . shows ((M.!) vm v)) "]"
+variableOrDerivDisplay vm (Derivative (RealVariableE v)) = (showString "dv[" . shows ((M.!) vm v)) "]"
+variableOrDerivDisplay vm _ = undefined
+
+paramDisplay :: M.Map RealExpression Int -> RealExpression -> String
+paramDisplay m ex = (showString "params[" . shows ((M.!) m ex)) "]"
+
+realExpressionToString :: (RealExpression -> String) -> M.Map RealCommonSubexpression String -> M.Map BoolCommonSubexpression String -> RealExpression -> String
 realExpressionToString _ _ _ (RealConstant c) = show c
-realExpressionToString vm _ _ (RealVariableE v) = (showString "v[" . shows ((M.!) vm v)) "]"
+realExpressionToString vm _ _ e@(RealVariableE v) = vm e
 realExpressionToString _ _ _ (BoundVariableE) = "t"
-realExpressionToString vm _ _ (Derivative (RealVariableE v)) = (showString "dv[" . shows ((M.!) vm v) . showString "]") ""
+realExpressionToString vm _ _ e@(Derivative (RealVariableE v)) = vm e
 realExpressionToString _ rcem _ (RealCommonSubexpressionE cse) = (M.!) rcem cse
 realExpressionToString vm rcem bcem (If b1 r1 r2) =
   (showString "("
@@ -296,21 +373,34 @@ makeResiduals :: BasicDAEModel -> M.Map RealVariable Int -> M.Map RealCommonSube
                  M.Map BoolCommonSubexpression String -> String
 makeResiduals m@(BasicDAEModel { equations = eqns, forcedInequalities = ieqs }) varNumMap realCSEMap boolCSEMap =
     let
-        ieqStrList = map (inequalityResidual varNumMap realCSEMap boolCSEMap) ieqs
-        eqnStrList = map (equationToResidualString varNumMap realCSEMap boolCSEMap) eqns
+        ieqStrList = map (inequalityTest (variableOrDerivDisplay varNumMap) realCSEMap
+                          boolCSEMap) ieqs
+        eqnStrList = map (equationToResidualString (variableOrDerivDisplay varNumMap) realCSEMap boolCSEMap) eqns
         strList = ieqStrList ++ eqnStrList
     in
-      concatMap makeResidual (zip [0..] strList)
+      (concatMap makeResidual (zip [0..] eqnStrList)) ++
+      if null ieqStrList then "" else
+        "if (!(" ++ (intercalate "&&" ieqStrList) ++ "))\n\
+         \  return 1;\n"
 
-makeBoundaryResiduals :: Int -> BasicDAEModel -> M.Map RealVariable Int -> M.Map RealCommonSubexpression String ->
+makeBoundaryResiduals :: BasicDAEModel -> M.Map RealExpression Int -> M.Map RealCommonSubexpression String ->
                  M.Map BoolCommonSubexpression String -> String
-makeBoundaryResiduals n0 m@(BasicDAEModel { boundaryEquations = eqns }) varNumMap realCSEMap boolCSEMap =
+makeBoundaryResiduals m@(BasicDAEModel { equations = meqns, boundaryEquations = beqns, forcedInequalities = ieqs }) paramNumMap realCSEMap boolCSEMap =
     let
-        strList = map (\(c, eq) -> (boolExpressionToString varNumMap realCSEMap boolCSEMap c,
-                                    equationToResidualString varNumMap realCSEMap boolCSEMap eq)) eqns
+        eqns = (map ((,) (BoolConstant True)) meqns) ++ beqns
+        estrList = map (\(c, eq) -> (boolExpressionToString (paramDisplay paramNumMap) realCSEMap boolCSEMap c,
+                                    equationToResidualString (paramDisplay paramNumMap) realCSEMap boolCSEMap eq)) eqns
+        ieqStrList = map (\ieq -> ("1", inequalityResidual (paramDisplay paramNumMap) realCSEMap boolCSEMap ieq)) ieqs
+        strList = estrList ++ ieqStrList
     in
-      concatMap (\(i, (c, res)) -> "if (" ++ c ++ ")\n " ++ (makeResidual (i, res)) ++ "else\n " ++
-                                   (makeResidual (i, "0"))) (zip [n0..] strList)
+      concatMap (\(i, (c, res)) ->
+                     if c == "1"
+                     then
+                         makeResidual (i, res)
+                     else
+                         "if (" ++ c ++ ")\n " ++ (makeResidual (i, res)) ++ "else\n " ++
+                         (makeResidual (i, "0"))
+                ) (zip [0..] strList)
 
 simplifyDerivatives mod =
   snd $
