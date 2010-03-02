@@ -12,6 +12,12 @@ import Data.Generics
 import Control.Monad.State
 import Data.Maybe
 import Text.ParserCombinators.Parsec
+import qualified System.IO.Unsafe as S
+import qualified System.Process as S
+import System.FilePath
+import System.Unix.Directory
+import System.Process
+import System.Exit
 
 data CodeGenerationError = OtherProblem String
 instance Error CodeGenerationError where strMsg s = OtherProblem s
@@ -24,8 +30,52 @@ data IntegrationResult = FatalError (Int, String, String, String) |
                          Result (Double, [Double], [Double]) |
                          Success deriving (Show, Read)
 
-modelToResults :: BasicDAEModel -> AllowCodeGenError ([IntegrationResult])
-modelToResults mod =
+data SolverParameters = SolverParameters {tStart :: Double,
+                                          maxSolverStep :: Double,
+                                          maxReportStep :: Double,
+                                          tEnd :: Double,
+                                          showEveryStep :: Double,
+                                          reltol :: Double,
+                                          abstol :: Double }
+defaultSolverParameters = SolverParameters 0 1 0.1 10 1 1E-6 1E-6
+
+otherProjectsPath = "other-projects"
+sundialsPath = otherProjectsPath </> "sundials-2.4.0"
+levmarPath = otherProjectsPath </> "levmar-2.5"
+
+compileCodeGetResults params code = 
+    withTemporaryDirectory "./" $ \dir ->
+      do
+        let codegenc = dir </> "codegen.c"
+        let codegenx = "/tmp" </> "codegen"
+        writeFile codegenc code
+        ret <- rawSystem "gcc" ["-O3", "-I", ".",
+                                "-I", levmarPath,
+                                "-L", levmarPath,
+                                "-I", sundialsPath </> "include",
+                                "-L", sundialsPath </> "src/nvec_ser/.libs/",
+                                "-L", sundialsPath </> "src/ida/.libs/",
+                                codegenc, 
+                                "-lsundials_ida", "-lsundials_nvecserial", "-lm",
+                                 "-llapack", "-llevmar",
+                                "-o", codegenx]
+        case ret
+          of
+            ExitFailure _ -> return $ Left (strMsg "Model doesn't compile")
+            ExitSuccess ->
+                do
+                  (_, inp, _) <- readProcessWithExitCode codegenx
+                                  (map (\a -> show $ a params)
+                                         [tStart, maxSolverStep, maxReportStep, tEnd, showEveryStep, reltol, abstol]
+                                  ) ""
+                  return (return (read inp))
+
+modelToResults :: BasicDAEModel -> SolverParameters -> AllowCodeGenError (M.Map RealVariable Int, [IntegrationResult])
+modelToResults mod params =
+    do
+        (varmap, code) <- makeCodeFor mod
+        res <- S.unsafePerformIO $ compileCodeGetResults params code
+        return (varmap, res)
 
 makeCodeFor :: BasicDAEModel -> AllowCodeGenError (M.Map RealVariable Int, String)
 makeCodeFor mod =

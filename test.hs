@@ -12,10 +12,8 @@ mymodelBuilder = do
   -- initialValue 0 (derivative y) 0
   (y .+. x) `newEq` (realConstant 5)
   -- newForcedInequality ((realConstant 100) .-. x)
-  newCheckedCondition "X out of range" ((realConstant 100) .<. x)
+  -- newCheckedCondition "X out of range" ((realConstant 100) .<. x)
   newInterventionRoot (x.-.(realConstant 100))
 
 mymodel = buildModel mymodelBuilder
-showCode (Left err) = show err
-showCode (Right (_, code)) = showString code "\n"
-main = putStr $ showCode $ makeCodeFor mymodel
+main = print $ modelToResults mymodel defaultSolverParameters
