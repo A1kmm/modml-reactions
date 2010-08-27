@@ -202,7 +202,7 @@ doProcessActivation :: ReactionModel -> ProcessActivation -> ProcessActivation
 doProcessActivation m pa =
     let
         newCompartments = findMissingCompartments m pa
-        candprocs = (candidateProcesses pa) `S.union` ()
+        candprocs = (candidateProcesses pa) `S.union` (newCompartments)
         snewActivePs = S.fromList newActivePs
     in
       ProcessActivation { activeProcesses = S.union (activeProcesses pa) snewActivePs,
