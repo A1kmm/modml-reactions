@@ -18,7 +18,7 @@ import qualified ModML.Core.BasicDAEModel as C
      be measured by a single real number. An entity can be an abstract
      concept like energy, or be more specific, like a particular molecule.
  -}
-newtype Entity = Entity Int deriving (Eq, Ord, D.Typeable, D.Data)
+data Entity = Entity U.Units Int deriving (Eq, Ord, D.Typeable, D.Data)
 
 {- | Compartment describes a place at which an entity can be located, and measured.
      The 'place' can be either physical or conceptual, depending on the
@@ -117,7 +117,9 @@ data ReactionModel = ReactionModel {
       -- | A description of which Compartments are contained within which other compartments.
       containment :: S.Set (Compartment, Compartment),
 
-      -- | A map from each entity instance to 
+      {- | A map from each compartment entity to the description of the
+           entity which contains it.
+       -}
       entityInstances :: M.Map CompartmentEntity EntityInstance,
 
       -- | Annotations on the reaction model...
@@ -170,8 +172,7 @@ isExpressionNonzero ex =
         Nothing -> Possibly
 
 isEntityInstanceNonzero :: EntityInstance -> ThreeState
-isEntityInstanceNonzero = isExpressionNonzero . EntityClamped
-
+isEntityInstanceNonzero (EntityClamped ex)= isExpressionNonzero ex
 isEntityInstanceNonzero (EntityFromProcesses v0ex dvex) =
     case (isExpressionNonzero v0ex, isExpressionNonzero dvex)
     of
@@ -198,17 +199,27 @@ startingProcessActivation m =
 findMissingCompartments pa =
     (S.fromList $ map snd $ newActiveCompartmentEntities pa) \\ (processedCompartments pa)
 
+newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> [Process]
+newCompartmentsToNewProcesses m newcs =
+    flip concatMap newcs $ \comp ->
+        map (flip id comp) allCompartmentProcesses
+
 doProcessActivation :: ReactionModel -> ProcessActivation -> ProcessActivation
 doProcessActivation m pa =
     let
         newCompartments = findMissingCompartments m pa
-        candprocs = (candidateProcesses pa) `S.union` (newCompartments)
-        snewActivePs = S.fromList newActivePs
+        candprocs = (candidateProcesses pa) `S.union` (newCompartmentsToNewProcesses m newCompartments)
+        newActivePs = S.filter (flip activationCriterion (activeCompartmentEntities pa)) candprocs
+        newActiveCEs = S.unions $ map creatableCompartmentEntities
+                                    (S.toList newActivePs)
     in
-      ProcessActivation { activeProcesses = S.union (activeProcesses pa) snewActivePs,
-                          newActiveProcesses = newActivePs,
-                          candidateProcesses = (candidateProcesses pa) \\ snewActivePs,
-                          activeCompartmentEntities = S.union (activeCompartmentEntities pa) (S.fromList newActiveCEs),
+      ProcessActivation { activeProcesses = S.union (activeProcesses pa) newActivePs,
+                          newActiveProcesses = S.toList newActivePs,
+                          candidateProcesses = candprocs \\ newActivePs,
+                          activeCompartmentEntities =
+                              (activeCompartmentEntities pa) `S.union`
+                              (S.fromList (newActiveCEs \\ 
+                                           (definiteInactiveCompartmentEntities pa))),
                           newActiveCompartmentEntities = newActiveCEs,
                           definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa),
                           processedCompartments = S.union (processedCompartments pa) (S.fromList newCompartments)
@@ -217,11 +228,55 @@ doProcessActivation m pa =
 needMoreProcessActivation pa = not (null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa))
 
 reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m ()
-reactionModelToUnits m =
-    let
-        activeCEs = activeCompartmentEntities $ until needMoreProcessActivation (doProcessActivation m) (startingProcessActivation m)
+reactionModelToUnits m = do
+    let activeCEs = activeCompartmentEntities $
+                      until needMoreProcessActivation
+                        (doProcessActivation m) (startingProcessActivation m)
+    let processes = (explicitCompartmentProcesses m) ++
+                      (concatMap (\c -> map (flip uncurry c) (containedCompartmentProcesses m))
+                                 ((S.toList . containment) m))
+    let eis = flip map activeCEs $ \ce@(_, Entity u _) ->
+                case M.lookup ce (entityInstances m)
+                of
+                  Just ei -> (ce, ei)
+                  Nothing -> (ce, EntityFromProcess (U.realConstantE u 0) (U.realConstantE u 0))
+    -- Each active CompartmentEntity gets a corresponding variable in the model...
+    ceToVar <-
+      liftM M.fromList $ forM activeCEs $ \ce@(_, Entity u _) -> do
+        v <- mkNewRealVariable u
+        -- To do: annotate model so CE can be identified.
+        return (ce, v)
+    -- and each process has a rate variable and a rate equation...
+    procToRateVar <-
+        liftM M.fromList $ forM processes $ \p -> do
+          v <- mkNewRealVariable U.dimensionlessE
+          (RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
+          return (p, v)
+    -- Each CE / EntityInstance also has an equation...
+    forM eis $ \(ce, ei) -> do
+      let v = fromJust $ M.lookup ce ceToVar
+      case ei
+        of
+          EntityClamped ex -> (RealVariableE v) `U.newEqM` ex
+          EntityFromProcesses ivex rateex -> do
+              (RealVariableE v) `U.newEqM` ivex
+              let fluxsum = 
+              (Derivative (RealVariableE v)) `U.newEqM` (fluxsum `U.plusM` rateex)
 
-        processes = (explicitCompartmentProcesses m) ++
-                    (concatMap (\c -> map (flip ($) c) (allCompartmentProcesses m)) ((S.toList . allCompartments) m)) ++
-                    (concatMap (\c -> map (flip uncurry c) (containedCompartmentProcesses m)) ((S.toList . containment) m))
-    in
+flipPair (a, b) = (b, a)
+transposeMap = M.fromList . map flipPair . M.toList
+composeMaps :: M.Map k a -> M.Map a b -> M.Map k b
+composeMaps m1 m2 = M.mapMaybe (flip M.lookup m2) m1
+substituteRateTemplate ceToVar p =
+  let
+      varSub = composeMaps (entityVariables p) ceToVar
+  in
+    everywhere (mkT $ substituteOneVariable varSub) (rateTemplate p)
+
+substituteOneVariable :: M.Map U.RealVariable U.RealVariable -> U.RealExpression -> U.RealExpression
+substituteOneVariable varSub (U.RealVariableE v) =
+    case (M.lookup v varSub)
+      of
+        Just v' = v'
+        Nothing = U.RealVariableE v
+substituteOneVariable _ ex = ex
