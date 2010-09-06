@@ -240,6 +240,7 @@ reactionModelToUnits m = do
                 of
                   Just ei -> (ce, ei)
                   Nothing -> (ce, EntityFromProcess (U.realConstantE u 0) (U.realConstantE u 0))
+    let eiMap = M.fromList eis
     -- Each active CompartmentEntity gets a corresponding variable in the model...
     ceToVar <-
       liftM M.fromList $ forM activeCEs $ \ce@(_, Entity u _) -> do
@@ -252,6 +253,7 @@ reactionModelToUnits m = do
           v <- mkNewRealVariable U.dimensionlessE
           (RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
           return (p, v)
+    let fluxMap = buildFluxMap processes procToRateVar ceToVar
     -- Each CE / EntityInstance also has an equation...
     forM eis $ \(ce, ei) -> do
       let v = fromJust $ M.lookup ce ceToVar
@@ -280,3 +282,10 @@ substituteOneVariable varSub (U.RealVariableE v) =
         Just v' = v'
         Nothing = U.RealVariableE v
 substituteOneVariable _ ex = ex
+buildFluxMap processes procToVar ceToVar = buildFluxMap' processes procToVar ceToVar M.empty
+buildFluxMap' [] _ _ m = m
+buildFluxMap' (p:processes) procToVar ceToVar m =
+    let
+        
+    in
+      
