@@ -1,0 +1,30 @@
+name:                 ModML
+version:              0.0.1
+cabal-version:        >= 1.6
+license:              BSD3
+build-type:           Simple
+copyright:            Andrew Miller
+author:               Andrew Miller
+maintainer:           Andrew Miller <ak.miller@auckland.ac.nz>
+stability:            experimental
+synopsis:             A mathematical modelling DSL built on functional transformations
+description:          A mathematical modelling DSL built on functional transformations
+
+library
+  hs-source-dirs:       .
+  exposed-modules:
+    ModML.Core.BasicDAESolver
+    ModML.Core.BasicDAEModel
+    ModML.Units.UnitsDAEModel
+    ModML.Units.SIUnits
+    ModML.Reactions.Reactions
+  build-depends: base ==4.*,
+                 process ==1.0.*,
+                 unix == 2.4.*,
+                 filepath == 1.1.*,
+                 parsec == 3.*,
+                 mtl == 1.1.*,
+                 syb == 0.1.*,
+                 containers == 0.3.*,
+                 typehash == 1.*
+ 

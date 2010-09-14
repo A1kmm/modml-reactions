@@ -10,9 +10,15 @@ where
 import qualified Data.Set as S
 import Data.Set ((\\))
 import qualified Data.Map as M
+import Data.Map ((!))
 import qualified Data.Data as D
+import qualified Data.TypeHash as D
 import qualified ModML.Units.UnitsDAEModel as U
 import qualified ModML.Core.BasicDAEModel as C
+import Control.Monad
+import Data.Maybe
+import Data.Generics
+import Data.List hiding ((\\))
 
 {- | Entity represents a specific 'thing' for which some sense of quantity can
      be measured by a single real number. An entity can be an abstract
@@ -225,12 +231,12 @@ doProcessActivation m pa =
                           processedCompartments = S.union (processedCompartments pa) (S.fromList newCompartments)
                         }
     
-needMoreProcessActivation pa = not (null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa))
+noMoreProcessActivation pa = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
 
 reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m ()
 reactionModelToUnits m = do
     let activeCEs = activeCompartmentEntities $
-                      until needMoreProcessActivation
+                      until noMoreProcessActivation
                         (doProcessActivation m) (startingProcessActivation m)
     let processes = (explicitCompartmentProcesses m) ++
                       (concatMap (\c -> map (flip uncurry c) (containedCompartmentProcesses m))
@@ -251,7 +257,7 @@ reactionModelToUnits m = do
     procToRateVar <-
         liftM M.fromList $ forM processes $ \p -> do
           v <- mkNewRealVariable U.dimensionlessE
-          (RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
+          (U.RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
           return (p, v)
     let fluxMap = buildFluxMap processes procToRateVar ceToVar
     -- Each CE / EntityInstance also has an equation...
@@ -259,11 +265,14 @@ reactionModelToUnits m = do
       let v = fromJust $ M.lookup ce ceToVar
       case ei
         of
-          EntityClamped ex -> (RealVariableE v) `U.newEqM` ex
+          EntityClamped ex -> (U.RealVariableE v) `U.newEqM` ex
           EntityFromProcesses ivex rateex -> do
-              (RealVariableE v) `U.newEqM` ivex
-              let fluxsum = 
-              (Derivative (RealVariableE v)) `U.newEqM` (fluxsum `U.plusM` rateex)
+              (U.RealVariableE v) `U.newEqM` ivex
+              let rate = case M.lookup ce fluxMap
+                           of
+                             Nothing -> rateex
+                             Just fluxes -> fluxes `U.plusM` rateex
+              (U.Derivative (U.RealVariableE v)) `U.newEqM` rate
 
 flipPair (a, b) = (b, a)
 transposeMap = M.fromList . map flipPair . M.toList
@@ -279,13 +288,30 @@ substituteOneVariable :: M.Map U.RealVariable U.RealVariable -> U.RealExpression
 substituteOneVariable varSub (U.RealVariableE v) =
     case (M.lookup v varSub)
       of
-        Just v' = v'
-        Nothing = U.RealVariableE v
+        Just v' -> v'
+        Nothing -> U.RealVariableE v
 substituteOneVariable _ ex = ex
+
+forFoldl' s0 l f = foldl' f s0 l
+alterWith m k f = M.alter f k m
+
+buildFluxMap :: [Process] -> M.Map Process U.RealVariable -> M.Map CompartmentEntity U.RealVariable -> M.Map CompartmentEntity U.RealExpression
 buildFluxMap processes procToVar ceToVar = buildFluxMap' processes procToVar ceToVar M.empty
 buildFluxMap' [] _ _ m = m
 buildFluxMap' (p:processes) procToVar ceToVar m =
     let
-        
+        procVar = procToVar!p
+        m' = forFoldl' m (M.toList $ stoichiometry p) $ \m0 (ce, (mup, u)) ->
+             case (M.lookup ce ceToVar)
+               of
+                 Nothing -> m0
+                 Just ceVar ->
+                     let rhs = (U.RealVariableE ceVar) `U.Times` (U.realConstantE u mup)
+                       in
+                         alterWith m0 ce $ \re0 ->
+                             case re0
+                             of
+                               Nothing -> rhs
+                               Just re -> re `U.Plus` rhs
     in
-      
+      buildFluxMap' processes procToVar ceToVar m'
