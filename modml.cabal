@@ -26,5 +26,5 @@ library
                  mtl == 1.1.*,
                  syb == 0.1.*,
                  containers == 0.3.*,
-                 typehash == 1.*
- 
+                 typehash == 1.*,
+                 random == 1.*
