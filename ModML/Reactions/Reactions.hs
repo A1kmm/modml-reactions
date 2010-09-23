@@ -14,7 +14,9 @@ import Data.Map ((!))
 import qualified Data.Data as D
 import qualified Data.TypeHash as D
 import qualified ModML.Units.UnitsDAEModel as U
+import qualified ModML.Core.BasicDAEModel as B
 import qualified ModML.Core.BasicDAEModel as C
+import qualified ModML.Units.SIUnits as SI
 import Control.Monad
 import Data.Maybe
 import Data.Generics
@@ -37,7 +39,7 @@ newtype Compartment = Compartment Int deriving (Eq, Ord, D.Typeable, D.Data)
      terms of concentration, or molar amounts, or charge, or charge per area or
      volume, depending on the entity and the requirements of the model.
  -}
-newtype Amount = Amount Double U.Units
+data Amount = Amount Double U.Units
 
 -- |  CompartmentEntity describes a specific entity, in a specific compartment.
 type CompartmentEntity = (Entity, Compartment)
@@ -50,6 +52,9 @@ type CompartmentEntity = (Entity, Compartment)
      affect the results).
  -}
 data Process = Process {
+      -- | The unique identifier for the Process.
+      processId :: Int,
+
       {- | activationCriterion is used to eliminate processes which do not apply
            because the CompartmentEntity essential for the process is missing. It
            is intended as an optimisation only - if we can't prove that a given
@@ -83,6 +88,10 @@ data Process = Process {
        -}
       rateTemplate :: U.RealExpression
     }  deriving (D.Typeable, D.Data)
+instance Eq Process where
+    Process { processId = ida} == Process { processId = idb } = ida == idb
+instance Ord Process where
+    Process { processId = ida} `compare` Process { processId = idb } = ida `compare` idb
 
 -- | EntityInstance describes how an EntityCompartment fits into the model.
 data EntityInstance =
@@ -101,7 +110,7 @@ data EntityInstance =
          to be added to the fluxes to make the final rate of change.
      -}
     EntityFromProcesses U.RealExpression U.RealExpression
-
+    deriving (D.Typeable, D.Data)
 -- | A ReactionModel describes which processes occur, and where.
 data ReactionModel = ReactionModel {
       {- | The list of processes where the compartment is known (for example,
@@ -138,6 +147,9 @@ data ReactionModel = ReactionModel {
       nextID :: Int
     } deriving (D.Typeable, D.Data)
 
+-- | The independent variable units for a reaction model, which is always seconds.
+independentUnits = SI.uSecond
+
 -- From here on in, we describe the algorithm to convert from a reaction to a units DAE model.
 
 data ProcessActivation = ProcessActivation {
@@ -153,10 +165,10 @@ data ProcessActivation = ProcessActivation {
 data ThreeState = DefiniteYes | Possibly | DefiniteNo
 
 splitFstBySnd3State :: [(a, ThreeState)] -> ([a], [a], [a])
-splitFstBySnd3State [] = []
+splitFstBySnd3State [] = ([], [], [])
 splitFstBySnd3State ((a, st3):b) =
     let
-        (y, p, n) = splitFirstBySecond b
+        (y, p, n) = splitFstBySnd3State b
     in
       case st3
       of
@@ -169,7 +181,8 @@ withSnd f (a, b) = (a, f b)
 isExpressionNonzero :: U.RealExpression -> ThreeState
 isExpressionNonzero ex =
     let
-        mc = tryEvaluateRealAsConstant . snd . U.translateRealExpression $ ex
+        mc = B.tryEvaluateRealAsConstant . snd . B.evalModel . U.runInCore independentUnits .
+             U.translateRealExpression $ ex
     in
       case mc
       of
@@ -194,12 +207,12 @@ startingProcessActivation m =
             splitFstBySnd3State $ map (withSnd isEntityInstanceNonzero) (M.toList . entityInstances $ m)
     in
       ProcessActivation { activeProcesses = S.empty,
+                          processedCompartments = S.empty,
                           newActiveProcesses = [],
                           candidateProcesses = S.fromList . explicitCompartmentProcesses $ m,
                           activeCompartmentEntities = S.fromList definiteCEs,
                           newActiveCompartmentEntities = definiteCEs,
-                          definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs,
-                          madeProgress = True
+                          definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
                         }
 
 findMissingCompartments pa =
@@ -208,13 +221,13 @@ findMissingCompartments pa =
 newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> [Process]
 newCompartmentsToNewProcesses m newcs =
     flip concatMap newcs $ \comp ->
-        map (flip id comp) allCompartmentProcesses
+        map (flip id comp) (allCompartmentProcesses m)
 
 doProcessActivation :: ReactionModel -> ProcessActivation -> ProcessActivation
 doProcessActivation m pa =
     let
-        newCompartments = findMissingCompartments m pa
-        candprocs = (candidateProcesses pa) `S.union` (newCompartmentsToNewProcesses m newCompartments)
+        newCompartments = findMissingCompartments pa
+        candprocs = (candidateProcesses pa) `S.union` (S.fromList $ newCompartmentsToNewProcesses m (S.toList newCompartments))
         newActivePs = S.filter (flip activationCriterion (activeCompartmentEntities pa)) candprocs
         newActiveCEs = S.unions $ map creatableCompartmentEntities
                                     (S.toList newActivePs)
@@ -224,11 +237,11 @@ doProcessActivation m pa =
                           candidateProcesses = candprocs \\ newActivePs,
                           activeCompartmentEntities =
                               (activeCompartmentEntities pa) `S.union`
-                              (S.fromList (newActiveCEs \\ 
-                                           (definiteInactiveCompartmentEntities pa))),
-                          newActiveCompartmentEntities = newActiveCEs,
+                              (newActiveCEs \\ 
+                                           (definiteInactiveCompartmentEntities pa)),
+                          newActiveCompartmentEntities = S.toList newActiveCEs,
                           definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa),
-                          processedCompartments = S.union (processedCompartments pa) (S.fromList newCompartments)
+                          processedCompartments = S.union (processedCompartments pa) (newCompartments)
                         }
     
 noMoreProcessActivation pa = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
@@ -239,29 +252,29 @@ reactionModelToUnits m = do
                       until noMoreProcessActivation
                         (doProcessActivation m) (startingProcessActivation m)
     let processes = (explicitCompartmentProcesses m) ++
-                      (concatMap (\c -> map (flip uncurry c) (containedCompartmentProcesses m))
-                                 ((S.toList . containment) m))
-    let eis = flip map activeCEs $ \ce@(_, Entity u _) ->
+                      (concatMap (\c -> map (flip id c) (containedCompartmentProcesses m))
+                                  ((S.toList . containment) m))
+    let eis = flip map (S.toList activeCEs) $ \ce@(Entity u _, _) ->
                 case M.lookup ce (entityInstances m)
                 of
                   Just ei -> (ce, ei)
-                  Nothing -> (ce, EntityFromProcess (U.realConstantE u 0) (U.realConstantE u 0))
+                  Nothing -> (ce, EntityFromProcesses (U.realConstantE u 0) (U.realConstantE u 0))
     let eiMap = M.fromList eis
     -- Each active CompartmentEntity gets a corresponding variable in the model...
     ceToVar <-
-      liftM M.fromList $ forM activeCEs $ \ce@(_, Entity u _) -> do
-        v <- mkNewRealVariable u
+      liftM M.fromList $ forM (S.toList activeCEs) $ \ce@(Entity u _, _) -> do
+        v <- U.mkNewRealVariable u
         -- To do: annotate model so CE can be identified.
         return (ce, v)
     -- and each process has a rate variable and a rate equation...
     procToRateVar <-
         liftM M.fromList $ forM processes $ \p -> do
-          v <- mkNewRealVariable U.dimensionlessE
+          v <- U.mkNewRealVariable U.dimensionlessE
           (U.RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
           return (p, v)
     let fluxMap = buildFluxMap processes procToRateVar ceToVar
     -- Each CE / EntityInstance also has an equation...
-    forM eis $ \(ce, ei) -> do
+    forM_ eis $ \(ce, ei) -> do
       let v = fromJust $ M.lookup ce ceToVar
       case ei
         of
@@ -271,12 +284,14 @@ reactionModelToUnits m = do
               let rate = case M.lookup ce fluxMap
                            of
                              Nothing -> rateex
-                             Just fluxes -> fluxes `U.plusM` rateex
+                             Just fluxes -> fluxes `U.Plus` rateex
               (U.Derivative (U.RealVariableE v)) `U.newEqM` rate
 
 flipPair (a, b) = (b, a)
+
+transposeMap :: (Ord k, Ord a) => M.Map k a -> M.Map a k
 transposeMap = M.fromList . map flipPair . M.toList
-composeMaps :: M.Map k a -> M.Map a b -> M.Map k b
+composeMaps :: (Ord k, Ord a) => M.Map k a -> M.Map a b -> M.Map k b
 composeMaps m1 m2 = M.mapMaybe (flip M.lookup m2) m1
 substituteRateTemplate ceToVar p =
   let
@@ -288,7 +303,7 @@ substituteOneVariable :: M.Map U.RealVariable U.RealVariable -> U.RealExpression
 substituteOneVariable varSub (U.RealVariableE v) =
     case (M.lookup v varSub)
       of
-        Just v' -> v'
+        Just v' -> U.RealVariableE v'
         Nothing -> U.RealVariableE v
 substituteOneVariable _ ex = ex
 
@@ -311,7 +326,7 @@ buildFluxMap' (p:processes) procToVar ceToVar m =
                          alterWith m0 ce $ \re0 ->
                              case re0
                              of
-                               Nothing -> rhs
-                               Just re -> re `U.Plus` rhs
+                               Nothing -> Just rhs
+                               Just re -> Just $ re `U.Plus` rhs
     in
       buildFluxMap' processes procToVar ceToVar m'
