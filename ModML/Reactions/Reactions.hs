@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable,MultiParamTypeClasses,FunctionalDependencies,FlexibleInstances #-}
 
 {- |
   The ModML reactions module used to describe a system in terms of processes on
@@ -18,28 +18,31 @@ import qualified ModML.Core.BasicDAEModel as B
 import qualified ModML.Core.BasicDAEModel as C
 import qualified ModML.Units.SIUnits as SI
 import Control.Monad
+import qualified Control.Monad.Trans as M
 import Data.Maybe
 import Data.Generics
 import Data.List hiding ((\\))
+import qualified Control.Monad.State as S
+import qualified Control.Monad.Identity as I
 
 {- | Entity represents a specific 'thing' for which some sense of quantity can
      be measured by a single real number. An entity can be an abstract
      concept like energy, or be more specific, like a particular molecule.
  -}
-data Entity = Entity U.Units Int deriving (Eq, Ord, D.Typeable, D.Data)
+data Entity = Entity U.Units Int deriving (Eq, Ord, Show, D.Typeable, D.Data)
 
 {- | Compartment describes a place at which an entity can be located, and measured.
      The 'place' can be either physical or conceptual, depending on the
      requirements of the model.
  -}
-newtype Compartment = Compartment Int deriving (Eq, Ord, D.Typeable, D.Data)
+newtype Compartment = Compartment Int deriving (Eq, Ord, Show, D.Typeable, D.Data)
 
 {- | Amount describes how much of an entity there is in a particular compartment,
      for a particular value of the independent variable. It may be described in
      terms of concentration, or molar amounts, or charge, or charge per area or
      volume, depending on the entity and the requirements of the model.
  -}
-data Amount = Amount Double U.Units
+data Amount = Amount Double U.Units deriving (Show)
 
 -- |  CompartmentEntity describes a specific entity, in a specific compartment.
 type CompartmentEntity = (Entity, Compartment)
@@ -121,13 +124,13 @@ data ReactionModel = ReactionModel {
       {- | Functions which should be used to generate a Process for every Compartment
            in the model
        -}
-      allCompartmentProcesses :: [Compartment -> Process],
+      allCompartmentProcesses :: [Int -> Compartment -> Process],
 
       {- | Functions for generating a Process from every pair of Compartments
            where one compartment is contained in another. Useful for processes
            which occur across membranes, for example.
        -}
-      containedCompartmentProcesses :: [(Compartment, Compartment) -> Process],
+      containedCompartmentProcesses :: [Int -> (Compartment, Compartment) -> Process],
 
       -- | A description of which Compartments are contained within which other compartments.
       containment :: S.Set (Compartment, Compartment),
@@ -146,6 +149,17 @@ data ReactionModel = ReactionModel {
       -- | The next identifier to allocate.
       nextID :: Int
     } deriving (D.Typeable, D.Data)
+
+emptyReactionModel = ReactionModel {
+                       explicitCompartmentProcesses = [],
+                       allCompartmentProcesses = [],
+                       containedCompartmentProcesses = [],
+                       containment = S.empty,
+                       entityInstances = M.empty,
+                       annotations = M.empty,
+                       contextTaggedIDs = M.empty,
+                       nextID = 0
+                     }
 
 -- | The independent variable units for a reaction model, which is always seconds.
 independentUnits = SI.uSecond
@@ -205,55 +219,64 @@ startingProcessActivation m =
     let
         (definiteCEs, _, definitelyNotCEs) =
             splitFstBySnd3State $ map (withSnd isEntityInstanceNonzero) (M.toList . entityInstances $ m)
+        (m', containProcs) = foldl' (\s (comp1, comp2) ->
+                                       foldl' (\(m'', l) f ->
+                                               (m''{nextID = nextID m'' + 1},
+                                                (f (nextID m'') (comp1, comp2)):l)
+                                               ) s (containedCompartmentProcesses m)
+                                    ) (m, []) (S.toList $ containment m)
     in
-      ProcessActivation { activeProcesses = S.empty,
-                          processedCompartments = S.empty,
-                          newActiveProcesses = [],
-                          candidateProcesses = S.fromList . explicitCompartmentProcesses $ m,
-                          activeCompartmentEntities = S.fromList definiteCEs,
-                          newActiveCompartmentEntities = definiteCEs,
-                          definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
-                        }
+      (m', ProcessActivation { activeProcesses = S.empty,
+                               processedCompartments = S.empty,
+                               newActiveProcesses = [],
+                               candidateProcesses = S.fromList . explicitCompartmentProcesses $ m,
+                               activeCompartmentEntities = S.fromList definiteCEs,
+                               newActiveCompartmentEntities = definiteCEs,
+                               definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
+                             })
 
 findMissingCompartments pa =
     (S.fromList $ map snd $ newActiveCompartmentEntities pa) \\ (processedCompartments pa)
 
-newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> [Process]
+newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> (ReactionModel, [Process])
 newCompartmentsToNewProcesses m newcs =
-    flip concatMap newcs $ \comp ->
-        map (flip id comp) (allCompartmentProcesses m)
+    foldl' (\s comp ->
+                foldl' (\(m', l) f -> (m'{ nextID = nextID m' + 1},
+                                       (f (nextID m') comp):l)) s (allCompartmentProcesses m)
+            ) (m, []) newcs
 
-doProcessActivation :: ReactionModel -> ProcessActivation -> ProcessActivation
-doProcessActivation m pa =
+doProcessActivation :: (ReactionModel, ProcessActivation) -> (ReactionModel, ProcessActivation)
+doProcessActivation (m, pa) =
     let
         newCompartments = findMissingCompartments pa
-        candprocs = (candidateProcesses pa) `S.union` (S.fromList $ newCompartmentsToNewProcesses m (S.toList newCompartments))
+        (m', newProcs) = newCompartmentsToNewProcesses m (S.toList newCompartments)
+        candprocs = (candidateProcesses pa) `S.union` (S.fromList newProcs)
         newActivePs = S.filter (flip activationCriterion (activeCompartmentEntities pa)) candprocs
         newActiveCEs = S.unions $ map creatableCompartmentEntities
                                     (S.toList newActivePs)
     in
-      ProcessActivation { activeProcesses = S.union (activeProcesses pa) newActivePs,
-                          newActiveProcesses = S.toList newActivePs,
-                          candidateProcesses = candprocs \\ newActivePs,
-                          activeCompartmentEntities =
-                              (activeCompartmentEntities pa) `S.union`
-                              (newActiveCEs \\ 
-                                           (definiteInactiveCompartmentEntities pa)),
-                          newActiveCompartmentEntities = S.toList newActiveCEs,
-                          definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa),
-                          processedCompartments = S.union (processedCompartments pa) (newCompartments)
-                        }
+      (m',
+       ProcessActivation { activeProcesses = S.union (activeProcesses pa) newActivePs,
+                           newActiveProcesses = S.toList newActivePs,
+                           candidateProcesses = candprocs \\ newActivePs,
+                           activeCompartmentEntities =
+                               (activeCompartmentEntities pa) `S.union`
+                               (newActiveCEs \\ 
+                                            (definiteInactiveCompartmentEntities pa)),
+                           newActiveCompartmentEntities = S.toList newActiveCEs,
+                           definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa),
+                           processedCompartments = S.union (processedCompartments pa) (newCompartments)
+                         }
+      )
     
-noMoreProcessActivation pa = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
+noMoreProcessActivation (_, pa) = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
 
 reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m ()
 reactionModelToUnits m = do
-    let activeCEs = activeCompartmentEntities $
-                      until noMoreProcessActivation
-                        (doProcessActivation m) (startingProcessActivation m)
-    let processes = (explicitCompartmentProcesses m) ++
-                      (concatMap (\c -> map (flip id c) (containedCompartmentProcesses m))
-                                  ((S.toList . containment) m))
+    let (m', activation) = until noMoreProcessActivation
+                             doProcessActivation (startingProcessActivation m)
+    let processes = S.toList . activeProcesses $ activation
+    let activeCEs = activeCompartmentEntities activation
     let eis = flip map (S.toList activeCEs) $ \ce@(Entity u _, _) ->
                 case M.lookup ce (entityInstances m)
                 of
@@ -262,9 +285,12 @@ reactionModelToUnits m = do
     let eiMap = M.fromList eis
     -- Each active CompartmentEntity gets a corresponding variable in the model...
     ceToVar <-
-      liftM M.fromList $ forM (S.toList activeCEs) $ \ce@(Entity u _, _) -> do
-        v <- U.mkNewRealVariable u
-        -- To do: annotate model so CE can be identified.
+      liftM M.fromList $ forM (S.toList activeCEs) $ \ce@(e@(Entity u eid), c@(Compartment cid)) -> do
+        -- Get the name of the entity...
+        let entityName = fromMaybe (shows eid "Unnamed Entity") $ getAnnotationFromModel m e "nameIs"
+        let compartmentName = fromMaybe (shows cid "Unnamed Compartment") $ getAnnotationFromModel m c "nameIs"
+        let vname = showString "(Amount of (" . showString entityName . showString ") in (" . showString compartmentName $ ")"
+        v <- U.mkNewNamedRealVariable u vname
         return (ce, v)
     -- and each process has a rate variable and a rate equation...
     procToRateVar <-
@@ -330,3 +356,159 @@ buildFluxMap' (p:processes) procToVar ceToVar m =
                                Just re -> Just $ re `U.Plus` rhs
     in
       buildFluxMap' processes procToVar ceToVar m'
+
+newtype ModelBuilderT m a = ModelBuilderT (S.StateT ReactionModel (U.ModelBuilderT m) a)
+type ModelBuilder = ModelBuilderT I.Identity
+
+modelBuilderTToState (ModelBuilderT a) = a
+
+instance Monad m => Monad (ModelBuilderT m)
+    where
+      (ModelBuilderT a) >>= b = ModelBuilderT $ a >>= (modelBuilderTToState . b)
+      return a = ModelBuilderT (return a)
+      fail a = ModelBuilderT (fail a)
+instance M.MonadTrans ModelBuilderT
+    where
+      lift a = ModelBuilderT $ M.lift $ M.lift a
+instance Monad m => S.MonadState ReactionModel (ModelBuilderT m)
+    where
+      get = ModelBuilderT $ S.get
+      put = ModelBuilderT . S.put
+class ReactionModelBuilderAccess m m1 | m -> m1
+    where
+      liftReactions :: ModelBuilderT m1 a -> m a
+instance ReactionModelBuilderAccess (ModelBuilderT m) m
+    where
+      liftReactions = id
+instance Monad m1 => U.UnitsModelBuilderAccess (ModelBuilderT m1) m1
+    where
+      liftUnits = ModelBuilderT . M.lift 
+instance Monad m1 => U.UnitsModelBuilderAccess (S.StateT s (ModelBuilderT m1)) m1
+    where
+      liftUnits = M.lift . U.liftUnits
+
+runModelBuilderT :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m (a, ReactionModel)
+runModelBuilderT = flip S.runStateT emptyReactionModel . modelBuilderTToState
+execModelBuilderT :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m ReactionModel
+execModelBuilderT = flip S.execStateT emptyReactionModel . modelBuilderTToState
+runReactionBuilderInUnitBuilder :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m a
+runReactionBuilderInUnitBuilder mb = do
+  (a, m) <- runModelBuilderT mb
+  reactionModelToUnits m
+  return a
+
+insertContextTag typetag tag v = S.modify (\m -> m {contextTaggedIDs = M.insert (typetag, tag) v (contextTaggedIDs m)})
+getContextTag :: Monad m => D.TypeCode -> D.TypeCode -> ModelBuilderT m (Maybe Int)
+getContextTag typetag tag = do
+  idmap <- S.gets contextTaggedIDs
+  return $ M.lookup (typetag, tag) idmap
+contextTaggedID typetag tag wrap allocm =
+    do
+      t <- getContextTag typetag tag
+      case t
+        of
+          Just id -> return $ wrap id
+          Nothing ->
+            do
+              id <- allocateID
+              allocm id
+              insertContextTag typetag tag id
+              return $ wrap id
+
+allocateID :: Monad m => ModelBuilderT m Int
+allocateID = S.modify (\m -> m { nextID = (+1) $ nextID m}) >> (S.gets $ flip (-) 1 . nextID)
+
+annotateModel :: (Show a, Show b, Show c, Monad m) => a -> b -> c -> ModelBuilderT m ()
+annotateModel s p o = S.modify (\m -> m { annotations = M.insert ((show s), (show p)) (show o) (annotations m) })
+getAnnotation :: (Show a, Show b, Monad m) => a -> b -> ModelBuilderT m (Maybe String)
+getAnnotation s p = do
+  am <- S.gets annotations
+  return $ M.lookup (show s, show p) am
+
+getAnnotationFromModel m s p = M.lookup (show s, show p) (annotations m)
+
+type ProcessBuilderT m a = S.StateT Process (ModelBuilderT m) a
+instance Monad m1 => ReactionModelBuilderAccess (S.StateT Process (ModelBuilderT m1)) m1
+    where
+      liftReactions = M.lift
+
+newExplicitProcess :: Monad m => ProcessBuilderT m a -> ModelBuilderT m Process
+newExplicitProcess pb = do
+  id <- allocateID
+  let p0 = Process { processId = id,
+                     activationCriterion = const True,
+                     creatableCompartmentEntities = S.empty,
+                     modifiableCompartmentEntities = S.empty,
+                     entityVariables = M.empty,
+                     stoichiometry = M.empty,
+                     rateTemplate = U.realConstantE U.dimensionlessE 0
+                   }
+  p1 <- S.execStateT pb p0
+  S.modify (\m -> m{explicitCompartmentProcesses = p1:(explicitCompartmentProcesses m)})
+  return p1
+
+newAllCompartmentProcess :: Monad m => (Compartment -> ProcessBuilderT m a) -> ModelBuilderT m ()
+newAllCompartmentProcess f = do
+  let p0 = Process { processId = 0, -- Placeholder ID...,
+                     activationCriterion = const True,
+                     creatableCompartmentEntities = S.empty,
+                     modifiableCompartmentEntities = S.empty,
+                     entityVariables = M.empty,
+                     stoichiometry = M.empty,
+                     rateTemplate = U.realConstantE U.dimensionlessE 0
+                   }
+  substCompartment <- liftM Compartment allocateID
+  p1 <- S.execStateT (f substCompartment) p0
+  let genFinalCompartment pid c =
+          everywhere (mkT $ substituteCompartments (M.singleton substCompartment c)) (p1{processId = pid})
+  S.modify (\m -> m{allCompartmentProcesses = genFinalCompartment:(allCompartmentProcesses m)})
+  return ()
+
+newContainedCompartmentProcess :: Monad m => (Compartment -> Compartment -> ProcessBuilderT m a) -> ModelBuilderT m ()
+newContainedCompartmentProcess f = do
+  let p0 = Process { processId = 0, -- Placeholder ID...,
+                     activationCriterion = const True,
+                     creatableCompartmentEntities = S.empty,
+                     modifiableCompartmentEntities = S.empty,
+                     entityVariables = M.empty,
+                     stoichiometry = M.empty,
+                     rateTemplate = U.realConstantE U.dimensionlessE 0
+                   }
+  substCompartment1 <- liftM Compartment allocateID
+  substCompartment2 <- liftM Compartment allocateID
+  p1 <- S.execStateT (f substCompartment1 substCompartment2) p0
+  let genFinalCompartment pid (c1, c2) =
+          everywhere (mkT $ substituteCompartments $
+                          M.fromList [(substCompartment1, c1),
+                                      (substCompartment2, c2)]) (p1{processId=pid})
+  S.modify (\m -> m{containedCompartmentProcesses = genFinalCompartment:(containedCompartmentProcesses m)})
+  return ()
+
+substituteCompartments :: M.Map Compartment Compartment -> Compartment -> Compartment
+substituteCompartments m c = M.findWithDefault c c m
+
+data IsEssentialForProcess = EssentialForProcess | NotEssentialForProcess
+data CanBeCreatedByProcess = CanBeCreatedByProcess | CantBeCreatedByProcess
+data CanBeModifiedByProcess = ModifiedByProcess | NotModifiedByProcess
+
+addEntity :: Monad m => IsEssentialForProcess -> CanBeCreatedByProcess -> CanBeModifiedByProcess ->
+                        Double -> CompartmentEntity -> ProcessBuilderT m U.RealVariable
+addEntity essential create modify stoich ce@(e@(Entity u eid), c@(Compartment cid)) = do
+  v <- U.liftUnits $ U.mkNewRealVariable u
+  case essential
+    of
+      EssentialForProcess -> S.modify (\p->p{activationCriterion=(\s -> (S.member ce s) && (activationCriterion p s))})
+      NotEssentialForProcess -> return ()
+  case create
+    of
+      CanBeCreatedByProcess -> S.modify (\p->p{creatableCompartmentEntities=S.insert ce (creatableCompartmentEntities p)})
+      CantBeCreatedByProcess -> return ()
+  case modify
+    of
+      ModifiedByProcess -> S.modify (\p->p{modifiableCompartmentEntities=S.insert ce (modifiableCompartmentEntities p)})
+      NotModifiedByProcess -> return ()
+  S.modify (\p -> p{entityVariables = M.insert v ce $ entityVariables p, stoichiometry = M.insert ce (stoich, u) (stoichiometry p)})
+  return v
+
+rateEquation :: Monad m => U.RealExpression -> ProcessBuilderT m U.RealVariable
+rateEquation r = S.modify (\p->p{rateTemplate=r})
