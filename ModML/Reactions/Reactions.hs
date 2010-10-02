@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable,MultiParamTypeClasses,FunctionalDependencies,FlexibleInstances #-}
+{-# LANGUAGE NoMonomorphismRestriction,DeriveDataTypeable,MultiParamTypeClasses,FunctionalDependencies,FlexibleInstances,TemplateHaskell #-}
 
 {- |
   The ModML reactions module used to describe a system in terms of processes on
@@ -24,6 +24,8 @@ import Data.Generics
 import Data.List hiding ((\\))
 import qualified Control.Monad.State as S
 import qualified Control.Monad.Identity as I
+import qualified Language.Haskell.TH.Syntax as T
+import qualified Data.Char as C
 
 {- | Entity represents a specific 'thing' for which some sense of quantity can
      be measured by a single real number. An entity can be an abstract
@@ -425,6 +427,12 @@ getAnnotation s p = do
   am <- S.gets annotations
   return $ M.lookup (show s, show p) am
 
+requireNameM :: (Monad m, Show a) => ModelBuilderT m a -> String -> ModelBuilderT m a
+requireNameM m n = do
+    m' <- m
+    annotateModel m' "nameIs" n
+    return m'
+
 getAnnotationFromModel m s p = M.lookup (show s, show p) (annotations m)
 
 type ProcessBuilderT m a = S.StateT Process (ModelBuilderT m) a
@@ -510,5 +518,65 @@ addEntity essential create modify stoich ce@(e@(Entity u eid), c@(Compartment ci
   S.modify (\p -> p{entityVariables = M.insert v ce $ entityVariables p, stoichiometry = M.insert ce (stoich, u) (stoichiometry p)})
   return v
 
-rateEquation :: Monad m => U.RealExpression -> ProcessBuilderT m U.RealVariable
+rateEquation :: Monad m => U.RealExpression -> ProcessBuilderT m ()
 rateEquation r = S.modify (\p->p{rateTemplate=r})
+
+data EntityTag = EntityTag deriving (D.Typeable, D.Data)
+entityTypeTag = D.typeCode EntityTag
+
+newEntity :: Monad m => U.Units -> ModelBuilderT m Entity
+newEntity u = allocateID >>= return . Entity u
+
+newTaggedEntity :: Monad m => U.Units -> D.TypeCode -> ModelBuilderT m Entity
+newTaggedEntity u tag = contextTaggedID entityTypeTag tag (Entity u) return
+newNamedEntity :: Monad m => U.Units -> String -> ModelBuilderT m Entity
+newNamedEntity u = requireNameM (newEntity u)
+newNamedTaggedEntity :: Monad m => U.Units -> D.TypeCode -> String -> ModelBuilderT m Entity
+newNamedTaggedEntity u t = requireNameM (newTaggedEntity u t)
+
+data CompartmentTag = CompartmentTag deriving (D.Typeable, D.Data)
+compartmentTypeTag = D.typeCode CompartmentTag
+
+newCompartment :: Monad m => ModelBuilderT m Compartment
+newCompartment = allocateID >>= return . Compartment
+
+newTaggedCompartment :: Monad m => D.TypeCode -> ModelBuilderT m Compartment
+newTaggedCompartment tag = contextTaggedID compartmentTypeTag tag Compartment return
+newNamedCompartment :: Monad m => String -> ModelBuilderT m Compartment
+newNamedCompartment = requireNameM newCompartment
+newNamedTaggedCompartment :: Monad m => D.TypeCode -> String -> ModelBuilderT m Compartment
+newNamedTaggedCompartment t = requireNameM (newTaggedCompartment t)
+
+addContainmentM :: Monad m => Compartment -> Compartment -> ModelBuilderT m ()
+addContainmentM c1 c2 = S.modify $ \m->m{containment=S.insert (c1,c2) (containment m)}
+addContainmentX :: Monad m => ModelBuilderT m Compartment -> ModelBuilderT m Compartment -> ModelBuilderT m ()
+addContainmentX mc1 mc2 = do
+  c1 <- mc1
+  c2 <- mc2
+  addContainmentM c1 c2
+addContainment = addContainmentX
+
+addEntityInstance :: Monad m => CompartmentEntity -> EntityInstance -> ModelBuilderT m ()
+addEntityInstance ce ei = S.modify $ \m->m{entityInstances=M.insert ce ei (entityInstances m)}
+
+
+-- Finally, also provide some Template Haskell utilities for declaring tagged Entities & Compartments...
+declareNamedTaggedSomething :: String -> String -> String -> T.Q [T.Dec]
+declareNamedTaggedSomething sth prettyName varName = do
+  let firstUpper [] = []
+  let firstUpper (a:l) = (C.toUpper a):l
+  let tagTypeName = T.mkName $ (firstUpper varName) ++ "Tag"
+  let dataDecl = T.DataD [] tagTypeName [] [T.NormalC tagTypeName []] [T.mkName "D.Typeable", T.mkName "D.Data"]
+  typeCodeExpr <- [e|D.typeCode|]
+  let tagVal = T.ValD (T.VarP $ T.mkName (varName ++ "Tag")) (T.NormalB $ T.AppE typeCodeExpr (T.ConE tagTypeName)) []
+  let contextMkBaseUnitExpr = T.mkName sth
+  let varVal = T.ValD (T.VarP $ T.mkName varName)
+                 (T.NormalB $ T.AppE (T.AppE (T.VarE contextMkBaseUnitExpr) $ T.VarE $ T.mkName (varName ++ "Tag"))
+                                     (T.LitE (T.StringL prettyName))) []
+  return [dataDecl, tagVal, varVal]
+
+declareNamedTaggedEntity :: String -> String -> T.Q [T.Dec]
+declareNamedTaggedEntity = declareNamedTaggedSomething "R.newNamedTaggedEntity"
+
+declareNamedTaggedCompartment :: String -> String -> T.Q [T.Dec]
+declareNamedTaggedCompartment = declareNamedTaggedSomething "R.newNamedTaggedCompartment"
