@@ -292,12 +292,12 @@ reactionModelToUnits m = do
         let entityName = fromMaybe (shows eid "Unnamed Entity") $ getAnnotationFromModel m e "nameIs"
         let compartmentName = fromMaybe (shows cid "Unnamed Compartment") $ getAnnotationFromModel m c "nameIs"
         let vname = showString "(Amount of (" . showString entityName . showString ") in (" . showString compartmentName $ ")"
-        v <- U.mkNewNamedRealVariable u vname
+        v <- U.newNamedRealVariable (return u) vname
         return (ce, v)
     -- and each process has a rate variable and a rate equation...
     procToRateVar <-
         liftM M.fromList $ forM processes $ \p -> do
-          v <- U.mkNewRealVariable U.dimensionlessE
+          v <- U.newRealVariable U.dimensionless
           (U.RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
           return (p, v)
     let fluxMap = buildFluxMap processes procToRateVar ceToVar
@@ -500,9 +500,9 @@ data CanBeCreatedByProcess = CanBeCreatedByProcess | CantBeCreatedByProcess
 data CanBeModifiedByProcess = ModifiedByProcess | NotModifiedByProcess
 
 addEntity :: Monad m => IsEssentialForProcess -> CanBeCreatedByProcess -> CanBeModifiedByProcess ->
-                        Double -> CompartmentEntity -> ProcessBuilderT m U.RealVariable
+                        Double -> CompartmentEntity -> ProcessBuilderT m (U.ModelBuilderT m U.RealVariable)
 addEntity essential create modify stoich ce@(e@(Entity u eid), c@(Compartment cid)) = do
-  v <- U.liftUnits $ U.mkNewRealVariable u
+  v <- U.liftUnits $ U.newRealVariable (return u)
   case essential
     of
       EssentialForProcess -> S.modify (\p->p{activationCriterion=(\s -> (S.member ce s) && (activationCriterion p s))})
@@ -516,10 +516,12 @@ addEntity essential create modify stoich ce@(e@(Entity u eid), c@(Compartment ci
       ModifiedByProcess -> S.modify (\p->p{modifiableCompartmentEntities=S.insert ce (modifiableCompartmentEntities p)})
       NotModifiedByProcess -> return ()
   S.modify (\p -> p{entityVariables = M.insert v ce $ entityVariables p, stoichiometry = M.insert ce (stoich, u) (stoichiometry p)})
-  return v
+  return $ return v
 
-rateEquation :: Monad m => U.RealExpression -> ProcessBuilderT m ()
-rateEquation r = S.modify (\p->p{rateTemplate=r})
+rateEquation :: Monad m => U.ModelBuilderT m U.RealExpression -> ProcessBuilderT m ()
+rateEquation rm = do
+  r <- U.liftUnits rm
+  S.modify (\p->p{rateTemplate=r})
 
 data EntityTag = EntityTag deriving (D.Typeable, D.Data)
 entityTypeTag = D.typeCode EntityTag
@@ -569,9 +571,9 @@ declareNamedTaggedSomething sth prettyName varName = do
   let dataDecl = T.DataD [] tagTypeName [] [T.NormalC tagTypeName []] [T.mkName "D.Typeable", T.mkName "D.Data"]
   typeCodeExpr <- [e|D.typeCode|]
   let tagVal = T.ValD (T.VarP $ T.mkName (varName ++ "Tag")) (T.NormalB $ T.AppE typeCodeExpr (T.ConE tagTypeName)) []
-  let contextMkBaseUnitExpr = T.mkName sth
+  let contextMk = T.mkName sth
   let varVal = T.ValD (T.VarP $ T.mkName varName)
-                 (T.NormalB $ T.AppE (T.AppE (T.VarE contextMkBaseUnitExpr) $ T.VarE $ T.mkName (varName ++ "Tag"))
+                 (T.NormalB $ T.AppE (T.AppE (T.VarE contextMk) $ T.VarE $ T.mkName (varName ++ "Tag"))
                                      (T.LitE (T.StringL prettyName))) []
   return [dataDecl, tagVal, varVal]
 
