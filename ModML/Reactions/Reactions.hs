@@ -152,6 +152,17 @@ data ReactionModel = ReactionModel {
       nextID :: Int
     } deriving (D.Typeable, D.Data)
 
+entityClamped :: Monad m => U.ModelBuilderT m U.RealExpression -> ModelBuilderT m EntityInstance
+entityClamped ex = do
+  ex' <- U.liftUnits ex
+  return $ EntityClamped ex'
+
+entityFromProcesses :: Monad m => U.ModelBuilderT m U.RealExpression -> U.ModelBuilderT m U.RealExpression -> ModelBuilderT m EntityInstance
+entityFromProcesses iv flux = do
+  iv' <- U.liftUnits iv
+  flux' <- U.liftUnits flux
+  return $ EntityFromProcesses iv' flux'
+
 emptyReactionModel = ReactionModel {
                        explicitCompartmentProcesses = [],
                        allCompartmentProcesses = [],
@@ -505,8 +516,13 @@ inCompartment e c = do
   c' <- c
   return (e', c')
 
+withCompartment :: Monad m => ModelBuilderT m Entity -> Compartment -> ModelBuilderT m CompartmentEntity
+withCompartment e c = do
+  e' <- e
+  return (e', c)
+
 addEntity :: Monad m => IsEssentialForProcess -> CanBeCreatedByProcess -> CanBeModifiedByProcess ->
-                        Double -> ModelBuilderT m CompartmentEntity -> ProcessBuilderT m (U.ModelBuilderT m U.RealVariable)
+                        Double -> ModelBuilderT m CompartmentEntity -> ProcessBuilderT m (U.ModelBuilderT m U.RealExpression)
 addEntity essential create modify stoich mce = do
   ce@(e@(Entity u eid), c@(Compartment cid)) <- M.lift mce
   v <- U.liftUnits $ U.newRealVariable (return u)
@@ -523,7 +539,7 @@ addEntity essential create modify stoich mce = do
       ModifiedByProcess -> S.modify (\p->p{modifiableCompartmentEntities=S.insert ce (modifiableCompartmentEntities p)})
       NotModifiedByProcess -> return ()
   S.modify (\p -> p{entityVariables = M.insert v ce $ entityVariables p, stoichiometry = M.insert ce (stoich, u) (stoichiometry p)})
-  return $ return v
+  return $ return (U.RealVariableE v)
 
 rateEquation :: Monad m => U.ModelBuilderT m U.RealExpression -> ProcessBuilderT m ()
 rateEquation rm = do
@@ -571,8 +587,11 @@ addContainmentX mc1 mc2 = do
   addContainmentM c1 c2
 addContainment = addContainmentX
 
-addEntityInstance :: Monad m => CompartmentEntity -> EntityInstance -> ModelBuilderT m ()
-addEntityInstance ce ei = S.modify $ \m->m{entityInstances=M.insert ce ei (entityInstances m)}
+addEntityInstance :: Monad m => ModelBuilderT m CompartmentEntity -> ModelBuilderT m EntityInstance -> ModelBuilderT m ()
+addEntityInstance ce ei = do
+  ce' <- ce
+  ei' <- ei
+  S.modify $ \m->m{entityInstances=M.insert ce' ei' (entityInstances m)}
 
 
 -- Finally, also provide some Template Haskell utilities for declaring tagged Entities & Compartments...
