@@ -26,6 +26,7 @@ import qualified Control.Monad.State as S
 import qualified Control.Monad.Identity as I
 import qualified Language.Haskell.TH.Syntax as T
 import qualified Data.Char as C
+import ModML.Units.UnitsDAEOpAliases
 
 {- | Entity represents a specific 'thing' for which some sense of quantity can
      be measured by a single real number. An entity can be an abstract
@@ -252,7 +253,7 @@ findMissingCompartments pa =
     (S.fromList $ map snd $ newActiveCompartmentEntities pa) \\ (processedCompartments pa)
 
 newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> (ReactionModel, [Process])
-newCompartmentsToNewProcesses m newcs =
+newCompartmentsToNewProcesses m newcs = 
     foldl' (\s comp ->
                 foldl' (\(m', l) f -> (m'{ nextID = nextID m' + 1},
                                        (f (nextID m') comp):l)) s (allCompartmentProcesses m)
@@ -264,9 +265,9 @@ doProcessActivation (m, pa) =
         newCompartments = findMissingCompartments pa
         (m', newProcs) = newCompartmentsToNewProcesses m (S.toList newCompartments)
         candprocs = (candidateProcesses pa) `S.union` (S.fromList newProcs)
-        newActivePs = S.filter (flip activationCriterion (activeCompartmentEntities pa)) candprocs
+        newActivePs = S.filter (not . flip activationCriterion (activeCompartmentEntities pa)) candprocs
         newActiveCEs = S.unions $ map creatableCompartmentEntities
-                                    (S.toList newActivePs)
+                         (S.toList newActivePs)
     in
       (m',
        ProcessActivation { activeProcesses = S.union (activeProcesses pa) newActivePs,
@@ -290,28 +291,30 @@ reactionModelToUnits m = do
                              doProcessActivation (startingProcessActivation m)
     let processes = S.toList . activeProcesses $ activation
     let activeCEs = activeCompartmentEntities activation
+    perTime <- U.boundUnits $**$ (-1)
     let eis = flip map (S.toList activeCEs) $ \ce@(Entity u _, _) ->
                 case M.lookup ce (entityInstances m)
                 of
                   Just ei -> (ce, ei)
-                  Nothing -> (ce, EntityFromProcesses (U.realConstantE u 0) (U.realConstantE u 0))
+                  Nothing -> (ce, EntityFromProcesses (U.realConstantE u 0)
+                                                      (U.realConstantE (u `U.unitsTimes` perTime) 0))
     let eiMap = M.fromList eis
     -- Each active CompartmentEntity gets a corresponding variable in the model...
     ceToVar <-
       liftM M.fromList $ forM (S.toList activeCEs) $ \ce@(e@(Entity u eid), c@(Compartment cid)) -> do
         -- Get the name of the entity...
-        let entityName = fromMaybe (shows eid "Unnamed Entity") $ getAnnotationFromModel m e "nameIs"
-        let compartmentName = fromMaybe (shows cid "Unnamed Compartment") $ getAnnotationFromModel m c "nameIs"
-        let vname = showString "(Amount of (" . showString entityName . showString ") in (" . showString compartmentName $ ")"
+        let entityName = fromMaybe (shows eid "Unnamed Entity") . liftM read $ getAnnotationFromModel m e "nameIs"
+        let compartmentName = fromMaybe (shows cid "Unnamed Compartment") . liftM read $ getAnnotationFromModel m c "nameIs"
+        let vname = showString "Amount of " . showString entityName . showString " in " $ compartmentName
         v <- U.newNamedRealVariable (return u) vname
         return (ce, v)
     -- and each process has a rate variable and a rate equation...
     procToRateVar <-
         liftM M.fromList $ forM processes $ \p -> do
-          v <- U.newRealVariable U.dimensionless
+          v <- U.newRealVariable (U.boundUnits $**$ (-1))
           (U.RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
           return (p, v)
-    let fluxMap = buildFluxMap processes procToRateVar ceToVar
+    let fluxMap = buildFluxMap processes procToRateVar
     -- Each CE / EntityInstance also has an equation...
     forM_ eis $ \(ce, ei) -> do
       let v = fromJust $ M.lookup ce ceToVar
@@ -319,7 +322,7 @@ reactionModelToUnits m = do
         of
           EntityClamped ex -> (U.RealVariableE v) `U.newEqM` ex
           EntityFromProcesses ivex rateex -> do
-              (U.RealVariableE v) `U.newEqM` ivex
+              U.newBoundaryEq (U.realConstant U.boundUnits 0 .==. U.boundVariable) (U.realVariableM v) (return ivex)
               let rate = case M.lookup ce fluxMap
                            of
                              Nothing -> rateex
@@ -349,26 +352,22 @@ substituteOneVariable _ ex = ex
 forFoldl' s0 l f = foldl' f s0 l
 alterWith m k f = M.alter f k m
 
-buildFluxMap :: [Process] -> M.Map Process U.RealVariable -> M.Map CompartmentEntity U.RealVariable -> M.Map CompartmentEntity U.RealExpression
-buildFluxMap processes procToVar ceToVar = buildFluxMap' processes procToVar ceToVar M.empty
-buildFluxMap' [] _ _ m = m
-buildFluxMap' (p:processes) procToVar ceToVar m =
+buildFluxMap :: [Process] -> M.Map Process U.RealVariable -> M.Map CompartmentEntity U.RealExpression
+buildFluxMap processes procToVar = buildFluxMap' processes procToVar M.empty
+buildFluxMap' [] _ m = m
+buildFluxMap' (p:processes) procToVar m =
     let
         procVar = procToVar!p
         m' = forFoldl' m (M.toList $ stoichiometry p) $ \m0 (ce, (mup, u)) ->
-             case (M.lookup ce ceToVar)
-               of
-                 Nothing -> m0
-                 Just ceVar ->
-                     let rhs = (U.RealVariableE ceVar) `U.Times` (U.realConstantE u mup)
-                       in
-                         alterWith m0 ce $ \re0 ->
-                             case re0
-                             of
-                               Nothing -> Just rhs
-                               Just re -> Just $ re `U.Plus` rhs
+               let rhs = (U.RealVariableE procVar) `U.Times` (U.realConstantE u mup)
+                 in
+                   alterWith m0 ce $ \re0 ->
+                     case re0
+                       of
+                         Nothing -> Just rhs
+                         Just re -> Just $ re `U.Plus` rhs
     in
-      buildFluxMap' processes procToVar ceToVar m'
+      buildFluxMap' processes procToVar m'
 
 newtype ModelBuilderT m a = ModelBuilderT (S.StateT ReactionModel (U.ModelBuilderT m) a)
 type ModelBuilder = ModelBuilderT I.Identity
