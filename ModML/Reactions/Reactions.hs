@@ -285,7 +285,7 @@ doProcessActivation (m, pa) =
     
 noMoreProcessActivation (_, pa) = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
 
-reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m ()
+reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealVariable, M.Map Process U.RealVariable)
 reactionModelToUnits m = do
     let (m', activation) = until noMoreProcessActivation
                              doProcessActivation (startingProcessActivation m)
@@ -328,6 +328,7 @@ reactionModelToUnits m = do
                              Nothing -> rateex
                              Just fluxes -> fluxes `U.Plus` rateex
               (U.Derivative (U.RealVariableE v)) `U.newEqM` rate
+    return (ceToVar, procToRateVar)
 
 flipPair (a, b) = (b, a)
 
@@ -406,8 +407,14 @@ execModelBuilderT = flip S.execStateT emptyReactionModel . modelBuilderTToState
 runReactionBuilderInUnitBuilder :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m a
 runReactionBuilderInUnitBuilder mb = do
   (a, m) <- runModelBuilderT mb
-  reactionModelToUnits m
+  _ <- reactionModelToUnits m
   return a
+
+runReactionBuilderInUnitBuilder' :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealVariable, M.Map Process U.RealVariable, a)
+runReactionBuilderInUnitBuilder' mb = do
+  (a, m) <- runModelBuilderT mb
+  (ce2v, p2v) <- reactionModelToUnits m
+  return (ce2v, p2v, a)
 
 insertContextTag typetag tag v = S.modify (\m -> m {contextTaggedIDs = M.insert (typetag, tag) v (contextTaggedIDs m)})
 getContextTag :: Monad m => D.TypeCode -> D.TypeCode -> ModelBuilderT m (Maybe Int)
