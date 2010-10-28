@@ -489,6 +489,9 @@ newAllCompartmentProcess f = do
   S.modify (\m -> m{allCompartmentProcesses = genFinalCompartment:(allCompartmentProcesses m)})
   return ()
 
+newAllCompartmentProcesses :: Monad m => [Compartment -> ProcessBuilderT m a] -> ModelBuilderT m ()
+newAllCompartmentProcesses l = sequence_ $ map newAllCompartmentProcess l
+
 newContainedCompartmentProcess :: Monad m => (Compartment -> Compartment -> ProcessBuilderT m a) -> ModelBuilderT m ()
 newContainedCompartmentProcess f = do
   let p0 = Process { processId = 0, -- Placeholder ID...,
