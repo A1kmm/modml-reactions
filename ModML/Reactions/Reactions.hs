@@ -27,6 +27,7 @@ import qualified Control.Monad.Identity as I
 import qualified Language.Haskell.TH.Syntax as T
 import qualified Data.Char as C
 import ModML.Units.UnitsDAEOpAliases
+import qualified Debug.Trace as DT
 
 {- | Entity represents a specific 'thing' for which some sense of quantity can
      be measured by a single real number. An entity can be an abstract
@@ -285,11 +286,14 @@ doProcessActivation (m, pa) =
     
 noMoreProcessActivation (_, pa) = null (newActiveProcesses pa) && null (newActiveCompartmentEntities pa)
 
-reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealVariable, M.Map Process U.RealVariable)
+reactionModelToUnits :: Monad m => ReactionModel -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealExpression, M.Map Process U.RealExpression)
 reactionModelToUnits m = do
     let (m', activation) = until noMoreProcessActivation
                              doProcessActivation (startingProcessActivation m)
     let processes = S.toList . activeProcesses $ activation
+    {- DT.trace (showString "Active process count = " . shows (length processes) .
+              showString ", compartments count = " . shows (S.size . processedCompartments $ activation) .
+              showString ", CEs counts = " . shows (S.size . activeCompartmentEntities $ activation) $ "") $! return () -}
     let activeCEs = activeCompartmentEntities activation
     perTime <- U.boundUnits $**$ (-1)
     let eis = flip map (S.toList activeCEs) $ \ce@(Entity u _, _) ->
@@ -300,67 +304,75 @@ reactionModelToUnits m = do
                                                       (U.realConstantE (u `U.unitsTimes` perTime) 0))
     let eiMap = M.fromList eis
     -- Each active CompartmentEntity gets a corresponding variable in the model...
-    ceToVar <-
+    ceToEx <-
       liftM M.fromList $ forM (S.toList activeCEs) $ \ce@(e@(Entity u eid), c@(Compartment cid)) -> do
         -- Get the name of the entity...
         let entityName = fromMaybe (shows eid "Unnamed Entity") . liftM read $ getAnnotationFromModel m e "nameIs"
         let compartmentName = fromMaybe (shows cid "Unnamed Compartment") . liftM read $ getAnnotationFromModel m c "nameIs"
         let vname = showString "Amount of " . showString entityName . showString " in " $ compartmentName
         v <- U.newNamedRealVariable (return u) vname
-        return (ce, v)
+        {- DT.trace ("Adding a named variable for CE: " ++ show (U.variableId v) ++ vname) $ return () -}
+        return (ce, U.RealVariableE v)
     -- and each process has a rate variable and a rate equation...
-    procToRateVar <-
+    procToRateEx <-
         liftM M.fromList $ forM processes $ \p -> do
           v <- U.newRealVariable (U.boundUnits $**$ (-1))
-          (U.RealVariableE v) `U.newEqM` (substituteRateTemplate ceToVar p)
-          return (p, v)
-    let fluxMap = buildFluxMap processes procToRateVar
+          let vex = U.RealVariableE v
+          {- DT.trace ("Adding a variable: " ++ show (U.variableId v)) $ return () -}
+          vex `U.newEqM` (substituteRateTemplate ceToEx p)
+          return (p, vex)
+    let fluxMap = buildFluxMap processes procToRateEx
     -- Each CE / EntityInstance also has an equation...
     forM_ eis $ \(ce, ei) -> do
-      let v = fromJust $ M.lookup ce ceToVar
+      let vex = fromJust $ M.lookup ce ceToEx
       case ei
         of
-          EntityClamped ex -> (U.RealVariableE v) `U.newEqM` ex
+          EntityClamped ex -> vex `U.newEqM` ex
           EntityFromProcesses ivex rateex -> do
-              U.newBoundaryEq (U.realConstant U.boundUnits 0 .==. U.boundVariable) (U.realVariableM v) (return ivex)
+              U.newBoundaryEq (U.realConstant U.boundUnits 0 .==. U.boundVariable) (return vex) (return ivex)
               let rate = case M.lookup ce fluxMap
                            of
                              Nothing -> rateex
                              Just fluxes -> fluxes `U.Plus` rateex
-              (U.Derivative (U.RealVariableE v)) `U.newEqM` rate
-    return (ceToVar, procToRateVar)
+              (U.Derivative vex) `U.newEqM` rate
+    return (ceToEx, procToRateEx)
 
 flipPair (a, b) = (b, a)
 
 transposeMap :: (Ord k, Ord a) => M.Map k a -> M.Map a k
 transposeMap = M.fromList . map flipPair . M.toList
-composeMaps :: (Ord k, Ord a) => M.Map k a -> M.Map a b -> M.Map k b
-composeMaps m1 m2 = M.mapMaybe (flip M.lookup m2) m1
-substituteRateTemplate ceToVar p =
+composeMapsDefault :: (Ord k, Ord a) => (k -> b) -> M.Map k a -> M.Map a b -> M.Map k b
+composeMapsDefault f m1 m2 = M.mapWithKey (\k a -> fromMaybe (f k) (M.lookup a m2)) m1
+substituteRateTemplate ceToEx p =
   let
-      varSub = composeMaps (entityVariables p) ceToVar
+      varSub = composeMapsDefault (\(U.RealVariable u _) -> U.realConstantE u 0) (entityVariables p) ceToEx
   in
-    everywhere (mkT $ substituteOneVariable varSub) (rateTemplate p)
+    {- DT.trace ((showString "Substituting rate template: Var->Var Map (" . shows varSub .
+               showString "), CE->Var map: (" . shows (entityVariables p) .
+               showString "), Var->CE map: (" .
+               shows ceToEx . showString "), Original " .
+               shows (rateTemplate p)) "") $! -}
+      everywhere (mkT $ substituteOneVariable varSub) (rateTemplate p)
 
-substituteOneVariable :: M.Map U.RealVariable U.RealVariable -> U.RealExpression -> U.RealExpression
+substituteOneVariable :: M.Map U.RealVariable U.RealExpression -> U.RealExpression -> U.RealExpression
 substituteOneVariable varSub (U.RealVariableE v) =
     case (M.lookup v varSub)
       of
-        Just v' -> U.RealVariableE v'
+        Just ex -> ex
         Nothing -> U.RealVariableE v
 substituteOneVariable _ ex = ex
 
 forFoldl' s0 l f = foldl' f s0 l
 alterWith m k f = M.alter f k m
 
-buildFluxMap :: [Process] -> M.Map Process U.RealVariable -> M.Map CompartmentEntity U.RealExpression
+buildFluxMap :: [Process] -> M.Map Process U.RealExpression -> M.Map CompartmentEntity U.RealExpression
 buildFluxMap processes procToVar = buildFluxMap' processes procToVar M.empty
 buildFluxMap' [] _ m = m
-buildFluxMap' (p:processes) procToVar m =
+buildFluxMap' (p:processes) procToEx m =
     let
-        procVar = procToVar!p
+        procEx = procToEx!p
         m' = forFoldl' m (M.toList $ stoichiometry p) $ \m0 (ce, (mup, u)) ->
-               let rhs = (U.RealVariableE procVar) `U.Times` (U.realConstantE u mup)
+               let rhs = procEx `U.Times` (U.realConstantE u mup)
                  in
                    alterWith m0 ce $ \re0 ->
                      case re0
@@ -368,7 +380,7 @@ buildFluxMap' (p:processes) procToVar m =
                          Nothing -> Just rhs
                          Just re -> Just $ re `U.Plus` rhs
     in
-      buildFluxMap' processes procToVar m'
+      buildFluxMap' processes procToEx m'
 
 newtype ModelBuilderT m a = ModelBuilderT (S.StateT ReactionModel (U.ModelBuilderT m) a)
 type ModelBuilder = ModelBuilderT I.Identity
@@ -410,7 +422,7 @@ runReactionBuilderInUnitBuilder mb = do
   _ <- reactionModelToUnits m
   return a
 
-runReactionBuilderInUnitBuilder' :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealVariable, M.Map Process U.RealVariable, a)
+runReactionBuilderInUnitBuilder' :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m (M.Map CompartmentEntity U.RealExpression, M.Map Process U.RealExpression, a)
 runReactionBuilderInUnitBuilder' mb = do
   (a, m) <- runModelBuilderT mb
   (ce2v, p2v) <- reactionModelToUnits m
@@ -535,6 +547,7 @@ addEntity :: Monad m => IsEssentialForProcess -> CanBeCreatedByProcess -> CanBeM
 addEntity essential create modify stoich mce = do
   ce@(e@(Entity u eid), c@(Compartment cid)) <- M.lift mce
   v <- U.liftUnits $ U.newRealVariable (return u)
+  {- DT.trace ((showString "Added a temporary variable: " . shows (U.variableId v)) "") $ return () -}
   case essential
     of
       EssentialForProcess -> S.modify (\p->p{activationCriterion=(\s -> (S.member ce s) && (activationCriterion p s))})
