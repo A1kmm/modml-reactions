@@ -15,7 +15,7 @@ library
   exposed-modules:
     ModML.Reactions.Reactions
   build-depends: base ==4.*,
-                 mtl == 1.1.*,
+                 mtl >= 1.0 && < 3,
                  syb == 0.1.*,
                  containers == 0.3.*,
                  typehash == 1.*,
