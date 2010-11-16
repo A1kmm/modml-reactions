@@ -16,8 +16,8 @@ library
     ModML.Reactions.Reactions
   build-depends: base ==4.*,
                  mtl >= 1.0 && < 3,
-                 syb == 0.1.*,
-                 containers == 0.3.*,
+                 syb >= 0.1 && < 0.3,
+                 containers >= 0.3 && < 0.5,
                  typehash == 1.*,
                  ModML-Core == 0.0.*,
                  ModML-Units == 0.0.*,
