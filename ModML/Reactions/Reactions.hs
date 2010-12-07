@@ -232,7 +232,7 @@ isEntityInstanceNonzero (EntityFromProcesses v0ex dvex) =
 
 startingProcessActivation m =
     let
-        (definiteCEs, _, definitelyNotCEs) =
+        (definiteCEs, maybeCEs, definitelyNotCEs) =
             splitFstBySnd3State $ map (withSnd isEntityInstanceNonzero) (M.toList . entityInstances $ m)
         (m', containProcs) = foldl' (\s (comp1, comp2) ->
                                        foldl' (\(m'', l) f ->
@@ -240,13 +240,14 @@ startingProcessActivation m =
                                                 (f (nextID m'') (comp1, comp2)):l)
                                                ) s (containedCompartmentProcesses m)
                                     ) (m, []) (S.toList $ containment m)
+        possiblyCEs = definiteCEs ++ maybeCEs
     in
       (m', ProcessActivation { activeProcesses = S.empty,
                                processedCompartments = S.empty,
                                newActiveProcesses = [],
                                candidateProcesses = S.fromList . explicitCompartmentProcesses $ m,
-                               activeCompartmentEntities = S.fromList definiteCEs,
-                               newActiveCompartmentEntities = definiteCEs,
+                               activeCompartmentEntities = S.fromList possiblyCEs,
+                               newActiveCompartmentEntities = possiblyCEs,
                                definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
                              })
 
