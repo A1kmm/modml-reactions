@@ -1,4 +1,4 @@
-{-# LANGUAGE NoMonomorphismRestriction,DeriveDataTypeable,MultiParamTypeClasses,FunctionalDependencies,FlexibleInstances,TemplateHaskell #-}
+{-# LANGUAGE NoMonomorphismRestriction,DeriveDataTypeable,MultiParamTypeClasses,FunctionalDependencies,FlexibleContexts,FlexibleInstances,TemplateHaskell #-}
 
 {- |
   The ModML reactions module used to describe a system in terms of processes on
@@ -19,6 +19,7 @@ import qualified ModML.Core.BasicDAEModel as C
 import qualified ModML.Units.SIUnits as SI
 import Control.Monad
 import qualified Control.Monad.Trans as M
+import qualified Control.Monad.Reader as R
 import Data.Maybe
 import Data.Generics
 import Data.List hiding ((\\))
@@ -400,6 +401,13 @@ instance Monad m => S.MonadState ReactionModel (ModelBuilderT m)
     where
       get = ModelBuilderT $ S.get
       put = ModelBuilderT . S.put
+instance Monad m => R.MonadReader ReactionModel (ModelBuilderT m)
+    where
+      ask = ModelBuilderT $ S.get
+      local f (ModelBuilderT mym) = ModelBuilderT $ do
+        mod <- S.get
+        M.lift $ S.evalStateT mym mod
+
 class ReactionModelBuilderAccess m m1 | m -> m1
     where
       liftReactions :: ModelBuilderT m1 a -> m a
@@ -412,6 +420,7 @@ instance Monad m1 => U.UnitsModelBuilderAccess (ModelBuilderT m1) m1
 instance Monad m1 => U.UnitsModelBuilderAccess (S.StateT s (ModelBuilderT m1)) m1
     where
       liftUnits = M.lift . U.liftUnits
+      
 
 runModelBuilderT :: Monad m => ModelBuilderT m a -> U.ModelBuilderT m (a, ReactionModel)
 runModelBuilderT = flip S.runStateT emptyReactionModel . modelBuilderTToState
@@ -430,10 +439,11 @@ runReactionBuilderInUnitBuilder' mb = do
   return (ce2v, p2v, a)
 
 insertContextTag typetag tag v = S.modify (\m -> m {contextTaggedIDs = M.insert (typetag, tag) v (contextTaggedIDs m)})
-getContextTag :: Monad m => D.TypeCode -> D.TypeCode -> ModelBuilderT m (Maybe Int)
+getContextTag :: R.MonadReader ReactionModel m => D.TypeCode -> D.TypeCode -> m (Maybe Int)
 getContextTag typetag tag = do
-  idmap <- S.gets contextTaggedIDs
+  idmap <- R.asks contextTaggedIDs
   return $ M.lookup (typetag, tag) idmap
+  
 contextTaggedID typetag tag wrap allocm =
     do
       t <- getContextTag typetag tag
@@ -532,13 +542,13 @@ data IsEssentialForProcess = EssentialForProcess | NotEssentialForProcess
 data CanBeCreatedByProcess = CanBeCreatedByProcess | CantBeCreatedByProcess
 data CanBeModifiedByProcess = ModifiedByProcess | NotModifiedByProcess
 
-inCompartment :: Monad m => ModelBuilderT m Entity -> ModelBuilderT m Compartment -> ModelBuilderT m CompartmentEntity
+inCompartment :: Monad m => m Entity -> m Compartment -> m CompartmentEntity
 inCompartment e c = do
   e' <- e
   c' <- c
   return (e', c')
 
-withCompartment :: Monad m => ModelBuilderT m Entity -> Compartment -> ModelBuilderT m CompartmentEntity
+withCompartment :: Monad m => m Entity -> Compartment -> m CompartmentEntity
 withCompartment e c = do
   e' <- e
   return (e', c)
@@ -618,18 +628,19 @@ addEntityInstance ce ei = do
 
 
 -- And some tools for filtering one model to produce another...
-filterExplicitCompartmentProcesses :: Monad m => (Process -> Bool) -> ModelBuilderT m ()
+filterExplicitCompartmentProcesses :: S.MonadState ReactionModel m => (Process -> R.Reader ReactionModel Bool) -> m ()
 filterExplicitCompartmentProcesses f =
-  S.modify (\m -> m { explicitCompartmentProcesses = filter f (explicitCompartmentProcesses m) })
+  S.modify (\m -> m { explicitCompartmentProcesses = filter (\p -> R.runReader (f p) m) (explicitCompartmentProcesses m) })
 
-filterAllCompartmentProcesses :: Monad m => (Compartment -> Process -> Bool) -> ModelBuilderT m ()
+filterAllCompartmentProcesses :: Monad m => (Compartment -> Process -> R.Reader ReactionModel Bool) -> ModelBuilderT m ()
 filterAllCompartmentProcesses f = do
   substCompartment <- liftM Compartment allocateID
   S.modify (\m -> m { explicitCompartmentProcesses =
-                         filter (f substCompartment) (map (\p -> p 0 substCompartment)
-                                                      (allCompartmentProcesses m))})
+                         filter (\p -> R.runReader (f substCompartment p) m)
+                                (map (\p -> p 0 substCompartment)
+                                     (allCompartmentProcesses m))})
 
-filterContainedCompartmentProcesses :: Monad m => ((Compartment, Compartment) -> Process -> Bool) -> ModelBuilderT m ()
+filterContainedCompartmentProcesses :: Monad m => ((Compartment, Compartment) -> Process -> R.Reader ReactionModel Bool) -> ModelBuilderT m ()
 filterContainedCompartmentProcesses f = do
   substCompartments <- liftM2 (,) (liftM Compartment allocateID) (liftM Compartment allocateID)
   S.modify (\m -> m { explicitCompartmentProcesses =
