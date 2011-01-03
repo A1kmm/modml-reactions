@@ -617,7 +617,26 @@ addEntityInstance ce ei = do
   S.modify $ \m->m{entityInstances=M.insert ce' ei' (entityInstances m)}
 
 
--- Finally, also provide some Template Haskell utilities for declaring tagged Entities & Compartments...
+-- And some tools for filtering one model to produce another...
+filterExplicitCompartmentProcesses :: Monad m => (Process -> Bool) -> ModelBuilderT m ()
+filterExplicitCompartmentProcesses f =
+  S.modify (\m -> m { explicitCompartmentProcesses = filter f (explicitCompartmentProcesses m) })
+
+filterAllCompartmentProcesses :: Monad m => (Compartment -> Process -> Bool) -> ModelBuilderT m ()
+filterAllCompartmentProcesses f = do
+  substCompartment <- liftM Compartment allocateID
+  S.modify (\m -> m { explicitCompartmentProcesses =
+                         filter (f substCompartment) (map (\p -> p 0 substCompartment)
+                                                      (allCompartmentProcesses m))})
+
+filterContainedCompartmentProcesses :: Monad m => ((Compartment, Compartment) -> Process -> Bool) -> ModelBuilderT m ()
+filterContainedCompartmentProcesses f = do
+  substCompartments <- liftM2 (,) (liftM Compartment allocateID) (liftM Compartment allocateID)
+  S.modify (\m -> m { explicitCompartmentProcesses =
+                         filter (f substCompartments) (map (\p -> p 0 substCompartments)
+                                                       (containedCompartmentProcesses m))})
+
+-- Also provide some Template Haskell utilities for declaring tagged Entities & Compartments...
 
 -- | Declares a named, tagged entity for use from multiple contexts, using
 -- | Template Haskell. Note that the first expression argument should have type
