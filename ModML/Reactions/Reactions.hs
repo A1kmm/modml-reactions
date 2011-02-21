@@ -95,7 +95,7 @@ data Process = Process {
            * The multiplier specified in the stoichiometry is applied.
        -}
       rateTemplate :: U.RealExpression
-    }  deriving (D.Typeable, D.Data)
+    } deriving (D.Typeable, D.Data)
 instance Eq Process where
     Process { processId = ida} == Process { processId = idb } = ida == idb
 instance Ord Process where
@@ -137,6 +137,9 @@ data ReactionModel = ReactionModel {
        -}
       containedCompartmentProcesses :: [Int -> (Compartment, Compartment) -> Process],
 
+      -- | All compartments in the model.
+      compartments :: S.Set Compartment,
+
       -- | A description of which Compartments are contained within which other compartments.
       containment :: S.Set (Compartment, Compartment),
 
@@ -170,6 +173,7 @@ emptyReactionModel = ReactionModel {
                        explicitCompartmentProcesses = [],
                        allCompartmentProcesses = [],
                        containedCompartmentProcesses = [],
+                       compartments = S.empty,
                        containment = S.empty,
                        entityInstances = M.empty,
                        annotations = M.empty,
@@ -188,8 +192,7 @@ data ProcessActivation = ProcessActivation {
       candidateProcesses :: S.Set Process,
       activeCompartmentEntities :: S.Set CompartmentEntity,
       newActiveCompartmentEntities :: [CompartmentEntity],
-      definiteInactiveCompartmentEntities :: S.Set CompartmentEntity,
-      processedCompartments :: S.Set Compartment
+      definiteInactiveCompartmentEntities :: S.Set CompartmentEntity
     }
 
 data ThreeState = DefiniteYes | Possibly | DefiniteNo
@@ -241,38 +244,31 @@ startingProcessActivation m =
                                                 (f (nextID m'') (comp1, comp2)):l)
                                                ) s (containedCompartmentProcesses m)
                                     ) (m, []) (S.toList $ containment m)
+        (m'', compProcs) = foldl' (\s comp ->
+                                    foldl' (\(m''', l) f ->
+                                             (m''' { nextID = nextID m''' + 1},
+                                               (f (nextID m''') comp):l)
+                                           ) s (allCompartmentProcesses m)
+                                  ) (m', []) (S.toList $ compartments m)
         possiblyCEs = definiteCEs ++ maybeCEs
     in
-      (m', ProcessActivation { activeProcesses = S.empty,
-                               processedCompartments = S.empty,
-                               newActiveProcesses = [],
-                               candidateProcesses = S.fromList . explicitCompartmentProcesses $ m,
-                               activeCompartmentEntities = S.fromList possiblyCEs,
-                               newActiveCompartmentEntities = possiblyCEs,
-                               definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
-                             })
-
-findMissingCompartments pa =
-    (S.fromList $ map snd $ newActiveCompartmentEntities pa) \\ (processedCompartments pa)
-
-newCompartmentsToNewProcesses :: ReactionModel -> [Compartment] -> (ReactionModel, [Process])
-newCompartmentsToNewProcesses m newcs = 
-    foldl' (\s comp ->
-                foldl' (\(m', l) f -> (m'{ nextID = nextID m' + 1},
-                                       (f (nextID m') comp):l)) s (allCompartmentProcesses m)
-            ) (m, []) newcs
+      (m'', ProcessActivation { activeProcesses = S.empty,
+                                newActiveProcesses = [],
+                                candidateProcesses = S.fromList (explicitCompartmentProcesses m ++ containProcs ++ compProcs),
+                                activeCompartmentEntities = S.fromList possiblyCEs,
+                                newActiveCompartmentEntities = possiblyCEs,
+                                definiteInactiveCompartmentEntities = S.fromList definitelyNotCEs
+                              })
 
 doProcessActivation :: (ReactionModel, ProcessActivation) -> (ReactionModel, ProcessActivation)
 doProcessActivation (m, pa) =
     let
-        newCompartments = findMissingCompartments pa
-        (m', newProcs) = newCompartmentsToNewProcesses m (S.toList newCompartments)
-        candprocs = (candidateProcesses pa) `S.union` (S.fromList newProcs)
+        candprocs = candidateProcesses pa
         newActivePs = S.filter (not . flip activationCriterion (activeCompartmentEntities pa)) candprocs
         newActiveCEs = S.unions $ map creatableCompartmentEntities
                          (S.toList newActivePs)
     in
-      (m',
+      (m,
        ProcessActivation { activeProcesses = S.union (activeProcesses pa) newActivePs,
                            newActiveProcesses = S.toList newActivePs,
                            candidateProcesses = candprocs \\ newActivePs,
@@ -281,8 +277,7 @@ doProcessActivation (m, pa) =
                                (newActiveCEs \\ 
                                             (definiteInactiveCompartmentEntities pa)),
                            newActiveCompartmentEntities = S.toList newActiveCEs,
-                           definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa),
-                           processedCompartments = S.union (processedCompartments pa) (newCompartments)
+                           definiteInactiveCompartmentEntities = (definiteInactiveCompartmentEntities pa)
                          }
       )
     
@@ -456,8 +451,11 @@ contextTaggedID typetag tag wrap allocm =
               allocm id
               insertContextTag typetag tag id
               return $ wrap id
+              
+queryContextTaggedID typetag tag wrap =
+  (liftM . liftM) wrap (getContextTag typetag tag)
 
-allocateID :: Monad m => ModelBuilderT m Int
+allocateID :: S.MonadState ReactionModel m => m Int
 allocateID = S.modify (\m -> m { nextID = (+1) $ nextID m}) >> (S.gets $ flip (-) 1 . nextID)
 
 annotateModel :: (Show a, Show b, Show c, Monad m) => a -> b -> c -> ModelBuilderT m ()
@@ -592,6 +590,7 @@ newTaggedEntity :: Monad m => U.ModelBuilderT m U.Units -> D.TypeCode -> ModelBu
 newTaggedEntity u tag = do
   u' <- U.liftUnits u
   contextTaggedID entityTypeTag tag (Entity u') return
+  
 newNamedEntity :: Monad m => U.ModelBuilderT m U.Units -> String -> ModelBuilderT m Entity
 newNamedEntity u = requireNameM (newEntity u)
 newNamedTaggedEntity :: Monad m => U.ModelBuilderT m U.Units -> D.TypeCode -> String -> ModelBuilderT m Entity
@@ -602,10 +601,15 @@ data CompartmentTag = CompartmentTag deriving (D.Typeable, D.Data)
 compartmentTypeTag = D.typeCode CompartmentTag
 
 newCompartment :: Monad m => ModelBuilderT m Compartment
-newCompartment = allocateID >>= return . Compartment
+newCompartment = do
+  id <- allocateID
+  let comp = Compartment id
+  S.modify (\m -> m{ compartments = S.insert comp (compartments m)})
+  return comp
 
 newTaggedCompartment :: Monad m => D.TypeCode -> ModelBuilderT m Compartment
-newTaggedCompartment tag = contextTaggedID compartmentTypeTag tag Compartment return
+newTaggedCompartment tag =
+  contextTaggedID compartmentTypeTag tag Compartment (\comp -> S.modify (\m -> m { compartments = S.insert (Compartment comp) (compartments m)}))
 newNamedCompartment :: Monad m => String -> ModelBuilderT m Compartment
 newNamedCompartment = requireNameM newCompartment
 newNamedTaggedCompartment :: Monad m => D.TypeCode -> String -> ModelBuilderT m Compartment
@@ -632,7 +636,7 @@ filterExplicitCompartmentProcesses :: S.MonadState ReactionModel m => (Process -
 filterExplicitCompartmentProcesses f =
   S.modify (\m -> m { explicitCompartmentProcesses = filter (\p -> R.runReader (f p) m) (explicitCompartmentProcesses m) })
 
-filterAllCompartmentProcesses :: Monad m => (Compartment -> Process -> R.Reader ReactionModel Bool) -> ModelBuilderT m ()
+filterAllCompartmentProcesses :: S.MonadState ReactionModel m => (Compartment -> Process -> R.Reader ReactionModel Bool) -> m ()
 filterAllCompartmentProcesses f = do
   substCompartment <- liftM Compartment allocateID
   S.modify (\m -> m { explicitCompartmentProcesses =
@@ -640,12 +644,35 @@ filterAllCompartmentProcesses f = do
                                 (map (\p -> p 0 substCompartment)
                                      (allCompartmentProcesses m))})
 
-filterContainedCompartmentProcesses :: Monad m => ((Compartment, Compartment) -> Process -> R.Reader ReactionModel Bool) -> ModelBuilderT m ()
+filterContainedCompartmentProcesses :: S.MonadState ReactionModel m => ((Compartment, Compartment) -> Process -> R.Reader ReactionModel Bool) -> m ()
 filterContainedCompartmentProcesses f = do
   substCompartments <- liftM2 (,) (liftM Compartment allocateID) (liftM Compartment allocateID)
   S.modify (\m -> m { explicitCompartmentProcesses =
-                         filter (f substCompartments) (map (\p -> p 0 substCompartments)
-                                                       (containedCompartmentProcesses m))})
+                         filter (\p -> R.runReader (f substCompartments p) m)
+                                (map (\p -> p 0 substCompartments)
+                                     (containedCompartmentProcesses m))})
+
+stoichiometryNoUnits = S.fromList . map (\(ce, (v, _)) -> (ce, v)) . M.toList . stoichiometry
+
+removeExplicitCompartmentProcessesInvolving :: S.MonadState ReactionModel m => [[m (CompartmentEntity, Double)]] -> m ()
+removeExplicitCompartmentProcessesInvolving ceSetsM = do
+  ceSets <- sequence $ map sequence $ ceSetsM
+  filterExplicitCompartmentProcesses $ \p -> return $ not $ any (all (flip S.member (stoichiometryNoUnits p))) ceSets
+
+removeAllCompartmentProcessesInvolving :: S.MonadState ReactionModel m => [[m (Entity, Double)]] -> m ()
+removeAllCompartmentProcessesInvolving eSetsM = do
+  eSets <- sequence $ map sequence $ eSetsM
+  filterAllCompartmentProcesses $ \c p -> return $ not $ any (all (flip S.member (stoichiometryNoUnits p)) .
+                                                              map (\(e, v) -> ((e, c), v))) eSets
+
+removeContainedCompartmentProcessesInvolving :: S.MonadState ReactionModel m => [[m (Entity, Double)]] -> m ()
+removeContainedCompartmentProcessesInvolving eSetsM = do
+  eSets <- sequence $ map sequence $ eSetsM
+  filterContainedCompartmentProcesses $ \(c1,c2) p -> do
+    let snp = stoichiometryNoUnits p
+    return $ not $ any (foldl' (\v (e, s) -> v && ((S.member ((e, c1), s) snp) ||
+                                                   (S.member ((e, c2), s) snp)
+                                                  )) True) eSets
 
 -- Also provide some Template Haskell utilities for declaring tagged Entities & Compartments...
 
